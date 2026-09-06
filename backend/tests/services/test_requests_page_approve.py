@@ -286,3 +286,12 @@ async def test_retry_over_cap_restores_prior_status_with_reason():
     assert "storage budget" in resp.message
     # flipped to 'pending' for the attempt, then restored to the pre-retry status
     assert history.async_update_status.await_args_list[-1].args == ("mbid-1", "failed")
+
+
+@pytest.mark.asyncio
+async def test_approved_clean_track_keeps_clean_variant():
+    service, history, downloads = _make(request_kind="track")
+    record = history.async_get_record.return_value
+    record.content_variant = "clean"
+    await service._dispatch_record(record, origin="approval")
+    assert downloads.request_track.await_args.kwargs["content_variant"] == "clean"

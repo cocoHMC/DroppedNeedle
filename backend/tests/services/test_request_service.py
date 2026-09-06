@@ -102,6 +102,7 @@ async def test_request_album_canonicalizes_release_alias_before_history_and_disp
         origin="user",
         release_mbid="release-edition",
         release_track_mbid=None,
+        content_variant="original",
     )
 
 
@@ -199,6 +200,7 @@ async def test_request_track_user_role_records_exact_metadata_and_awaits_approva
         track_title="Airbag",
         duration_seconds=287,
         track_release_group_mbid="release-group-1",
+        content_variant="original",
     )
 
 
@@ -597,3 +599,28 @@ async def test_request_album_resolves_download_service_per_dispatch():
 
     ds_a.request_album.assert_awaited_once()  # first dispatch used the original engine
     ds_b.request_album.assert_awaited_once()  # second used the NEW one (fails if captured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["user", "admin"])
+async def test_track_route_content_variant_survives_approval_boundary(role):
+    service, history, downloads = _make_service()
+    response = await service.request_track("clean-recording", artist_name="Artist", track_title="Clean song", user_id="listener", user_role=role, content_variant="clean")
+    assert history.async_record_request.await_args.kwargs["content_variant"] == "clean"
+    if role == "user":
+        assert response.status == "awaiting_approval"
+        downloads.request_track.assert_not_awaited()
+    else:
+        assert response.status == "queued"
+        assert downloads.request_track.await_args.kwargs["content_variant"] == "clean"
+
+
+@pytest.mark.asyncio
+async def test_clean_request_does_not_reuse_unverified_original_request():
+    service, history, downloads = _make_service()
+    history.async_get_record.return_value = SimpleNamespace(status="pending", content_variant="original")
+    from core.exceptions import ValidationError
+    with pytest.raises(ValidationError):
+        await service.request_track("recording", artist_name="Artist", track_title="Song", user_id="listener", user_role="admin", content_variant="clean")
+    downloads.request_track.assert_not_awaited()
+    history.async_add_requester.assert_not_awaited()

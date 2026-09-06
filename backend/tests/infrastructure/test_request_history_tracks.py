@@ -22,11 +22,13 @@ async def test_exact_track_metadata_survives_request_history_round_trip(tmp_path
         track_title="Airbag",
         duration_seconds=287,
         track_release_group_mbid="release-group-1",
+        content_variant="clean",
     )
 
     record = await store.async_get_record("RECORDING-1")
 
     assert record is not None
+    assert record.content_variant == "clean"
     assert record.request_kind == "track"
     assert record.track_title == "Airbag"
     assert record.duration_seconds == 287
@@ -42,6 +44,7 @@ async def test_legacy_album_request_defaults_to_album_kind(tmp_path):
     record = await store.async_get_record("release-group-1")
 
     assert record is not None
+    assert record.content_variant == "original"
     assert record.request_kind == "album"
     assert record.track_title is None
 

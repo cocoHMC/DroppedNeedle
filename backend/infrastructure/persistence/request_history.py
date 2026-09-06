@@ -59,6 +59,7 @@ class RequestHistoryRecord(msgspec.Struct):
     track_title: str | None = None
     duration_seconds: int | None = None
     track_release_group_mbid: str | None = None
+    content_variant: str = "original"
 
 
 class RequestHistoryStore:
@@ -118,6 +119,7 @@ class RequestHistoryStore:
                 ("track_title", "TEXT"),
                 ("duration_seconds", "INTEGER"),
                 ("track_release_group_mbid", "TEXT"),
+                ("content_variant", "TEXT NOT NULL DEFAULT 'original'"),
             ]:
                 try:
                     conn.execute(
@@ -234,6 +236,7 @@ class RequestHistoryStore:
             reviewed_at=row["reviewed_at"] if "reviewed_at" in keys else None,
             request_kind=(row["request_kind"] if "request_kind" in keys else "album")
             or "album",
+            content_variant=(row["content_variant"] if "content_variant" in keys else "original") or "original",
             track_title=row["track_title"] if "track_title" in keys else None,
             duration_seconds=(
                 row["duration_seconds"] if "duration_seconds" in keys else None
@@ -263,6 +266,7 @@ class RequestHistoryStore:
         track_title: str | None = None,
         duration_seconds: int | None = None,
         track_release_group_mbid: str | None = None,
+        content_variant: str = "original",
     ) -> None:
         requested_at = datetime.now(timezone.utc).isoformat()
         normalized_mbid = musicbrainz_id.lower()
@@ -275,8 +279,8 @@ class RequestHistoryStore:
                     artist_mbid, year, cover_url, requested_at, completed_at, status,
                     monitor_artist, auto_download_artist, user_id, requested_by_name,
                     release_mbid, request_kind, track_title, duration_seconds,
-                    track_release_group_mbid
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    track_release_group_mbid, content_variant
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(musicbrainz_id_lower) DO UPDATE SET
                     musicbrainz_id = excluded.musicbrainz_id,
                     artist_name = excluded.artist_name,
@@ -295,7 +299,8 @@ class RequestHistoryStore:
                     request_kind = excluded.request_kind,
                     track_title = excluded.track_title,
                     duration_seconds = excluded.duration_seconds,
-                    track_release_group_mbid = excluded.track_release_group_mbid
+                    track_release_group_mbid = excluded.track_release_group_mbid,
+                    content_variant = excluded.content_variant
                 """,
                 (
                     normalized_mbid,
@@ -316,6 +321,7 @@ class RequestHistoryStore:
                     track_title,
                     duration_seconds,
                     track_release_group_mbid,
+                    content_variant,
                 ),
             )
             if user_id is not None:

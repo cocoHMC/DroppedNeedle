@@ -495,6 +495,7 @@ class RequestsPageService:
                 release_group_mbid=record.track_release_group_mbid,
                 artist_mbid=record.artist_mbid,
                 release_mbid=record.release_mbid,
+                content_variant=getattr(record, "content_variant", "original"),
             )
         return await self._acquisition.request_album(
             user_id=user_id,

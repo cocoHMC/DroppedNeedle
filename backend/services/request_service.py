@@ -271,6 +271,7 @@ class RequestService:
         release_group_mbid: str | None = None,
         artist_mbid: str | None = None,
         release_mbid: str | None = None,
+        content_variant: str = "original",
         user_id: str,
         user_role: str,
         requested_by_name: str | None = None,
@@ -282,8 +283,12 @@ class RequestService:
         acquisition without review. The previous route bypassed approval and
         made exact-track requests less safe than whole-album requests.
         """
+        if content_variant not in ("original", "clean"):
+            raise ValidationError("Unknown track content variant")
         needs_approval = user_role not in ("trusted", "admin")
         existing = await self._request_history.async_get_record(recording_mbid)
+        if existing and getattr(existing, "content_variant", "original") != content_variant:
+            raise ValidationError("This recording already has a different content request. Choose a verified distinct recording.")
         if existing and existing.status in (
             "awaiting_approval",
             "pending",
@@ -319,6 +324,7 @@ class RequestService:
             track_title=track_title,
             duration_seconds=duration_seconds,
             track_release_group_mbid=release_group_mbid,
+            content_variant=content_variant,
         )
 
         if needs_approval:
@@ -340,6 +346,7 @@ class RequestService:
                 release_group_mbid=release_group_mbid,
                 artist_mbid=artist_mbid,
                 release_mbid=release_mbid,
+                content_variant=content_variant,
             )
         except Exception:
             await self._request_history.async_update_status(
