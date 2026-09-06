@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from core.exceptions import ExternalServiceError
 import repositories.musicbrainz_album as album_module
 from infrastructure.queue.priority_queue import RequestPriority
 from infrastructure.resilience.retry import CircuitOpenError
@@ -71,10 +72,8 @@ async def test_get_release_by_id_degrades_quietly_when_breaker_open(
     open_breaker, caplog
 ) -> None:
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
-        assert (
+        with pytest.raises(ExternalServiceError, match="temporarily unavailable"):
             await _Repo().get_release_by_id("release-1", priority=RequestPriority.USER_INITIATED)
-            is None
-        )
     assert caplog.records == []
     open_breaker.assert_called_once()
 

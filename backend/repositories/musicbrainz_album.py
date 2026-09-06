@@ -874,11 +874,13 @@ class MusicBrainzAlbumMixin:
                 return None
             await self._cache.set(cache_key, result, ttl_seconds=3600)
             return result
-        except Exception as e:  # noqa: BLE001
-            if not isinstance(e, CircuitOpenError):
-                logger.error(f"Failed to fetch release {release_id}: {e}")
-            _record_mb_degradation(f"release fetch failed: {e}")
-            return None
+        except (httpx.HTTPError, CircuitOpenError, ExternalServiceError) as error:
+            _record_mb_degradation("release metadata temporarily unavailable")
+            # A network outage is not proof that the selected edition does not
+            # exist. Preserve the retryable service failure for acquisition.
+            raise ExternalServiceError(
+                "MusicBrainz release metadata is temporarily unavailable. Try again later."
+            ) from error
 
     async def get_release_group_id_from_release(
         self,
