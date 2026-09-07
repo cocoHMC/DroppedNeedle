@@ -40,12 +40,26 @@ Needle's image and application-identification environment setting changed.
   `0228077b-505d-4224-a882-d8d044bc8ed5`, edition
   `64160dc9-9841-4301-a0a2-537ec74472de`, and release-track
   `42b30c94-65ea-4211-9447-43e3f870e85f`.
-- The task reached the real acquisition pipeline. Acceptance and metadata
-  resolution are proven; downloaded/imported audio is a separate result and
-  must not be inferred from the queued task.
+- The task completed: one file imported, zero failures, at
+  `2026-09-07T00:44:01.432821Z`. The owner's configured Soulseek fallback
+  supplied the recording; no acquisition-source policy changed.
+- The imported FLAC is 25,646,191 bytes, stereo 16-bit/44.1 kHz, duration
+  226.321020 seconds. `ffprobe` and a full `ffmpeg` decode-to-null both exited
+  zero without audio errors. SHA-256:
+  `226be34ad830b1609005c83c79227864efb91f9c871083c0bd0ce98e3fa44671`.
+- Tonarr's real iOS library found the recording automatically. Native playback
+  ran through its natural 3:46 ending; pause/resume and adding/playing the next
+  track also worked. Source: `951ff79`.
+- Signed Google Store Tonarr 1000011 played the same recording through a public
+  HTTPS Navidrome reviewer connection on Android TV API 36, paused/resumed via
+  media controls, then automatically advanced to the next track. This proves
+  emulator playback, not physical Fire TV certification or later builds.
 
 Sanitized receipts are in `/root/artifacts/tonarr-request-acceptance/`:
-`dn-network-recovery-request.json` and `dn-recovered-track-status.json`.
+`dn-network-recovery-request.json`, `dn-recovered-track-status.json`,
+`dn-completed-download-proof.json`, and `dn-android-tv-playback.json`.
+iOS observations are in
+`/root/artifacts/tonarr-production-apple/dn-native-playback.json`.
 
 Upstream had previously addressed blocked application identification in
 [commit a4aa4ad](https://github.com/DroppedNeedle/DroppedNeedle/commit/a4aa4ad48f03319bf5950becf936c9aefec49b76).
