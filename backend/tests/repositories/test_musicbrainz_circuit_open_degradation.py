@@ -62,7 +62,8 @@ async def test_get_release_group_by_id_degrades_quietly_when_breaker_open(
     open_breaker, caplog
 ) -> None:
     with caplog.at_level(logging.ERROR, logger="repositories.musicbrainz_album"):
-        assert await _Repo().get_release_group_by_id("rg-1") is None
+        with pytest.raises(ExternalServiceError, match="temporarily unavailable"):
+            await _Repo().get_release_group_by_id("rg-1")
     assert caplog.records == []
     open_breaker.assert_called_once()
 
