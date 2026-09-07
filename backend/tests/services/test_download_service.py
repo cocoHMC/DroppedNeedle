@@ -1888,3 +1888,22 @@ async def test_upgrade_origin_never_fetches_an_unheld_recording():
 
     assert result == ALREADY_IN_LIBRARY
     store.create_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_edition", [False, True])
+async def test_metadata_outage_is_retryable_and_never_starts_acquisition(explicit_edition):
+    from core.exceptions import ExternalServiceError
+
+    albums = _single_album_service()
+    outage = ExternalServiceError("MusicBrainz metadata is temporarily unavailable")
+    albums.get_album_tracks_info.side_effect = outage
+    albums.get_exact_edition_tracks_info.side_effect = outage
+    service, store, *_ = _make_service(album_service=albums)
+    store.get_active_task_for_album.return_value = None
+    with pytest.raises(ExternalServiceError, match="temporarily unavailable"):
+        await service.request_album(
+            "u1", "rg", "A", "B",
+            release_mbid="selected-edition" if explicit_edition else None,
+        )
+    store.create_task.assert_not_awaited()

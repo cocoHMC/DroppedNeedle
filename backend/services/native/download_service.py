@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from core.exceptions import (
     AutomaticManagementHoldError,
     ConfigurationError,
+    ExternalServiceError,
     PermissionDeniedError,
     ResourceNotFoundError,
     ValidationError,
@@ -323,6 +324,10 @@ class DownloadService:
                     release_group_mbid,
                     priority=priority,
                 )
+        except ExternalServiceError:
+            # Preserve a retryable catalog outage; it says nothing about whether
+            # the exact edition exists. No task is created before identity resolves.
+            raise
         except Exception as error:  # noqa: BLE001 - fail closed before any task exists
             raise ValidationError(
                 "The exact MusicBrainz edition could not be verified. No download was started."

@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir --prefix=/install -r /tmp/requirements.txt
 
 FROM python:3.13.5-slim
 
-ARG COMMIT_TAG
+ARG COMMIT_TAG=dev
 ARG BUILD_DATE
 ARG DROPPEDNEEDLE_SOURCE_REVISION=unknown
 

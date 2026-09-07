@@ -157,3 +157,30 @@ class TestInstanceId:
         settings = Settings(instance_id="", root_app_dir=tmp_path)
         ua = settings.get_user_agent()
         assert "unknown" in ua
+
+
+@pytest.mark.parametrize("tag", [None, "", "   "])
+def test_user_agent_always_has_a_version(tmp_path, monkeypatch, tag):
+    from core.config import Settings
+    if tag is None:
+        monkeypatch.delenv("COMMIT_TAG", raising=False)
+    else:
+        monkeypatch.setenv("COMMIT_TAG", tag)
+    settings = Settings(root_app_dir=tmp_path)
+    assert settings.get_user_agent().split()[0] == "DroppedNeedleApp/dev"
+
+
+def test_maintained_integration_can_identify_itself_without_changing_rate_limits(tmp_path):
+    from core.config import Settings
+    agent = "TonarrRequests/1.0 (self-hosted Dropped Needle integration; support@example.test)"
+    settings = Settings(root_app_dir=tmp_path, http_user_agent=agent)
+    assert settings.get_user_agent() == agent
+    defaults = MusicBrainzConnectionSettings()
+    assert defaults.rate_limit == 1.0
+
+
+def test_user_agent_rejects_header_injection(tmp_path):
+    from core.config import Settings
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        Settings(root_app_dir=tmp_path, http_user_agent="TonarrRequests/1.0\r\nX-Extra: value")

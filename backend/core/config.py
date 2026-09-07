@@ -65,6 +65,12 @@ class Settings(BaseSettings):
         default="contact@droppedneedle.com",
         description="Contact email for MusicBrainz API User-Agent. Override with your own if desired."
     )
+    http_user_agent: str | None = Field(
+        default=None,
+        max_length=512,
+        pattern=r"^[\x20-\x7E]*$",
+        description="Optional truthful application/version and contact identification for maintained integrations. Does not change provider rate limits.",
+    )
     discover_warmer_enabled: bool = Field(
         default=True,
         description="Proactively warm per-user Discover/Home in the background through the day (kill switch)."
@@ -158,7 +164,9 @@ class Settings(BaseSettings):
         return self
     
     def get_user_agent(self) -> str:
-        version = os.environ.get("COMMIT_TAG", "dev")
+        if self.http_user_agent and self.http_user_agent.strip():
+            return self.http_user_agent.strip()
+        version = os.environ.get("COMMIT_TAG", "").strip() or "dev"
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
         email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
         return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
