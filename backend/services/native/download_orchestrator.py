@@ -1466,9 +1466,21 @@ class DownloadOrchestrator:
         if self._album_service is None or not task.release_group_mbid:
             return None
         try:
-            info = await self._album_service.get_album_tracks_info(
-                task.release_group_mbid, priority=RequestPriority.BACKGROUND_SYNC
-            )
+            if task.release_mbid:
+                info = await self._album_service.get_exact_edition_tracks_info(
+                    task.release_group_mbid, task.release_mbid,
+                    priority=RequestPriority.BACKGROUND_SYNC,
+                )
+            else:
+                info = await self._album_service.get_album_tracks_info(
+                    task.release_group_mbid, priority=RequestPriority.BACKGROUND_SYNC
+                )
+                selected = getattr(info, "selected_release_mbid", None)
+                if selected:
+                    info = await self._album_service.get_exact_edition_tracks_info(
+                        task.release_group_mbid, selected,
+                        priority=RequestPriority.BACKGROUND_SYNC,
+                    )
         except Exception:  # noqa: BLE001 - MB failure must never block completion
             logger.warning(
                 "coverage.tracklist_unavailable",

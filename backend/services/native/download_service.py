@@ -334,6 +334,13 @@ class DownloadService:
                     release_group_mbid,
                     priority=priority,
                 )
+                # The fast album page may contain only the tracks currently held.
+                # Acquisition must use the catalog edition's full tracklist.
+                selected = getattr(info, "selected_release_mbid", None)
+                if selected:
+                    info = await self._album_service.get_exact_edition_tracks_info(
+                        release_group_mbid, selected, priority=priority
+                    )
         except ExternalServiceError:
             # Preserve a retryable catalog outage; it says nothing about whether
             # the exact edition exists. No task is created before identity resolves.

@@ -723,6 +723,10 @@ def _with_album_service(service, *, total_tracks=12, raises=False):
                 selected_release_mbid="release-1",
             )
         )
+    album_service.get_exact_edition_tracks_info = AsyncMock(
+        side_effect=RuntimeError("MB down") if raises else None,
+        return_value=album_service.get_album_tracks_info.return_value,
+    )
     service._album_service = album_service
     return album_service
 
@@ -1952,3 +1956,17 @@ async def test_exact_requested_edition_controls_existing_album_check():
     album.get_exact_edition_tracks_info.assert_awaited_once()
     assert album.get_exact_edition_tracks_info.call_args.args == ("rg", "deluxe-release")
     album.get_album_tracks_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_partial_tracklist_cannot_define_complete_acquisition():
+    album = _single_album_service(total=10, tracks=_held_album_tracks(10))
+    album.get_album_tracks_info.return_value = SimpleNamespace(
+        tracks=_held_album_tracks(5), total_tracks=5, selected_release_mbid="release-1")
+    service, store, *_ = _make_service(in_library=True, album_service=album)
+    service._library.get_file_rows_for_album.return_value = [
+        {"recording_mbid": f"rec-{i}", "track_number": i, "disc_number": 1}
+        for i in range(1, 6)]
+    store.get_active_task_for_album.return_value = None
+    assert await service.request_album("u1", "rg", "A", "B") == "task1"
+    assert store.create_task.call_args.kwargs["track_count"] == 10
