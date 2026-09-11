@@ -255,6 +255,9 @@ async def test_request_album_already_in_library_not_linked_as_task_id():
 
     assert response.success is True
     assert response.message == "Album is already in the library"
+    assert response.status == "completed"
+    request_history.async_update_status.assert_awaited_once()
+    assert request_history.async_update_status.call_args.args == ("rg-123", "completed")
     request_history.async_update_download_task_id.assert_not_awaited()
 
 

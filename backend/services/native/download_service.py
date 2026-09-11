@@ -46,6 +46,7 @@ from services.native.album_preflight_scorer import (
     rank_stored_candidates,
 )
 from services.native.download_orchestrator import DownloadOrchestrator
+from services.native.coverage import match_rows_to_tracks
 from services.native.library_manager import LibraryManager
 from services.native.quality_tiers import should_acquire, tier_for, tier_rank
 
@@ -210,16 +211,25 @@ class DownloadService:
             )
 
     async def _already_satisfied(
-        self, release_group_mbid: str, origin: str = "user"
+        self, release_group_mbid: str, origin: str = "user", release_mbid: str | None = None
     ) -> bool:
-        """True when the library already holds this album at a quality this request won't
-        improve on. Origin-aware (D18): only an ``origin='upgrade'`` request may treat a
-        below-cutoff held album as not-satisfied - replace-on-import fires only for
-        upgrades, so re-fetching for any other origin would download bytes that are then
-        skipped at placement. Every non-upgrade origin sees any held copy as satisfied."""
+        """A held quality tier does not establish a complete album.
+
+        Fill missing tracks through the normal request path; only explicit upgrades
+        may replace otherwise complete tracks with a higher-quality encoding.
+        """
         held = await self._library.album_quality_tier(release_group_mbid)
         if origin != "upgrade":
-            return held is not None
+            if held is None:
+                return False
+            if self._album_service is None:
+                return True  # Legacy callers without catalog resolution retain their gate.
+            _, tracks, _ = await self._resolve_acquisition_identity(
+                release_group_mbid, release_mbid
+            )
+            rows = await self._library.get_file_rows_for_album(release_group_mbid)
+            covered, _, _ = match_rows_to_tracks(rows, tracks)
+            return covered == len(tracks)
         if held is None:
             # An upgrade of nothing is not an upgrade: an un-held album must go
             # through the normal (quota/cap-checked) request path, never the
@@ -742,7 +752,7 @@ class DownloadService:
         # skipped for orphan-track requests, which download a track whose album
         # isn't in the library yet
         if download_type == "album" and await self._already_satisfied(
-            release_group_mbid, origin
+            release_group_mbid, origin, release_mbid
         ):
             return ALREADY_IN_LIBRARY
 

@@ -243,11 +243,14 @@ class RequestService:
             raise ExternalServiceError(f"Failed to start download: {e}")
 
         if task_id == ALREADY_IN_LIBRARY:
+            await self._request_history.async_update_status(
+                musicbrainz_id, "completed", completed_at=datetime.now(timezone.utc).isoformat()
+            )
             return RequestAcceptedResponse(
                 success=True,
                 message="Album is already in the library",
                 musicbrainz_id=musicbrainz_id,
-                status="pending",
+                status="completed",
             )
 
         await self._request_history.async_update_download_task_id(
@@ -487,6 +490,10 @@ class RequestService:
                 if task_id != ALREADY_IN_LIBRARY:
                     await self._request_history.async_update_download_task_id(
                         mbid, task_id
+                    )
+                else:
+                    await self._request_history.async_update_status(
+                        mbid, "completed", completed_at=datetime.now(timezone.utc).isoformat()
                     )
                 dispatched += 1
 
