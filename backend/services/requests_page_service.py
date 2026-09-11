@@ -393,6 +393,8 @@ class RequestsPageService:
 
     # download_task.status -> request_history.status
     _TASK_TO_REQUEST_STATUS = {
+        "queued": "pending",
+        "searching": "downloading",
         "downloading": "downloading",
         "processing": "downloading",
         "completed": "imported",
@@ -425,6 +427,8 @@ class RequestsPageService:
         task = await self._find_download_task(record)
         if task is not None:
             mapped = self._TASK_TO_REQUEST_STATUS.get(task.status)
+            if mapped == "imported" and not self._task_is_complete(task):
+                mapped = "incomplete"
             if mapped and mapped != record.status:
                 completed_at = (
                     datetime.now(timezone.utc).isoformat()
@@ -556,19 +560,23 @@ class RequestsPageService:
         record: RequestHistoryRecord,
         library_mbids: set[str],
     ) -> bool:
-        now_iso = datetime.now(timezone.utc).isoformat()
+        # Album presence means at least one track exists. It must never finish a
+        # queued repair or turn a partial edition into a completed request.
+        task = await self._find_download_task(record)
+        if task is None or not self._task_is_complete(task):
+            return False
+        await self._request_history.async_update_status(
+            record.musicbrainz_id, "imported",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await self._notify_import(record)
+        return True
 
-        if (
-            record.request_kind != "track"
-            and record.musicbrainz_id.lower() in library_mbids
-        ):
-            await self._request_history.async_update_status(
-                record.musicbrainz_id, "imported", completed_at=now_iso
-            )
-            await self._notify_import(record)
-            return True
-
-        return False
+    @staticmethod
+    def _task_is_complete(task) -> bool:
+        total = getattr(task, "files_total", 0) or 0
+        completed = getattr(task, "files_completed", 0) or 0
+        return task.status == "completed" and total > 0 and completed >= total
 
     async def _notify_import(self, record: RequestHistoryRecord) -> None:
         self._library_mbids_cache = None

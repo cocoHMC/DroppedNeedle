@@ -295,3 +295,28 @@ async def test_approved_clean_track_keeps_clean_variant():
     record.content_variant = "clean"
     await service._dispatch_record(record, origin="approval")
     assert downloads.request_track.await_args.kwargs["content_variant"] == "clean"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,completed,total,expected", [
+    ("queued", 0, 10, False), ("completed", 5, 10, False),
+    ("completed", 0, 0, False), ("completed", 10, 10, True),
+])
+async def test_library_presence_does_not_complete_unfinished_task(status, completed, total, expected):
+    service, history, _ = _make(record_status="pending", download_task_id="task-1")
+    record = await history.async_get_record("mbid-1")
+    service._download_store = MagicMock()
+    service._download_store.get_task = AsyncMock(return_value=SimpleNamespace(
+        status=status, files_completed=completed, files_total=total))
+    service._notify_import = AsyncMock()
+    result = await service._check_if_completed(record, {"mbid-1"})
+    assert result is expected
+    assert history.async_update_status.await_count == int(expected)
+
+
+@pytest.mark.asyncio
+async def test_library_presence_without_task_is_not_completion_evidence():
+    service, history, _ = _make(record_status="pending")
+    record = await history.async_get_record("mbid-1")
+    assert await service._check_if_completed(record, {"mbid-1"}) is False
+    history.async_update_status.assert_not_awaited()
