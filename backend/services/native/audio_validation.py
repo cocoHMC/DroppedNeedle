@@ -30,6 +30,7 @@ async def validate_audio(path: Path, *, timeout: float = 180) -> None:
         # FLAC STREAMINFO declares the exact sample count. A clean EOF between
         # frames can hide a truncated tail from the decoder's exit status.
         if path.suffix.lower() == ".flac":
+            from mutagen import MutagenError
             from mutagen.flac import FLAC
             try:
                 info = await asyncio.to_thread(lambda: FLAC(path).info)
@@ -40,7 +41,7 @@ async def validate_audio(path: Path, *, timeout: float = 180) -> None:
                     raise AudioValidationError("Audio stream is incomplete", corrupt=True)
             except AudioValidationError:
                 raise
-            except (OSError, ValueError, TypeError) as exc:
+            except (MutagenError, OSError, ValueError, TypeError) as exc:
                 raise AudioValidationError("Audio stream metadata is invalid", corrupt=True) from exc
     finally:
         if process.returncode is None:
