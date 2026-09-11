@@ -309,14 +309,28 @@ async def test_library_presence_does_not_complete_unfinished_task(status, comple
     service._download_store.get_task = AsyncMock(return_value=SimpleNamespace(
         status=status, files_completed=completed, files_total=total))
     service._notify_import = AsyncMock()
-    result = await service._check_if_completed(record, {"mbid-1"})
-    assert result is expected
-    assert history.async_update_status.await_count == int(expected)
+    await service._reconcile_request(record, {"mbid-1"})
+    assert (record.status == "imported") is expected
+    assert service._notify_import.await_count == int(expected)
 
 
 @pytest.mark.asyncio
 async def test_library_presence_without_task_is_not_completion_evidence():
     service, history, _ = _make(record_status="pending")
     record = await history.async_get_record("mbid-1")
-    assert await service._check_if_completed(record, {"mbid-1"}) is False
+    await service._reconcile_request(record, {"mbid-1"})
+    assert record.status == "pending"
     history.async_update_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_imported_history_returns_to_queued_when_repair_is_active():
+    service, history, _ = _make(record_status="imported", download_task_id="repair")
+    record = await history.async_get_record("mbid-1")
+    record.completed_at = "2026-09-11T10:00:00Z"
+    service._download_store = MagicMock()
+    service._download_store.get_task = AsyncMock(return_value=SimpleNamespace(status="queued"))
+    await service._reconcile_request(record, {"mbid-1"})
+    assert record.status == "pending"
+    assert record.completed_at is None
+    history.async_update_status.assert_awaited_once_with("mbid-1", "pending", completed_at=None)

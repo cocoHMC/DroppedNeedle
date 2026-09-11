@@ -81,8 +81,8 @@ class RequestsPageService:
                 items.append(self._build_pending_item(record))
                 continue
 
-            completed = await self._check_if_completed(record, library_mbids)
-            if completed:
+            await self._reconcile_request(record, library_mbids)
+            if record.status == "imported":
                 continue
             items.append(self._build_pending_item(record))
 
@@ -110,6 +110,14 @@ class RequestsPageService:
             )
 
         library_mbids = await self._fetch_library_mbids()
+
+        # Reconcile historical rows too: older versions could mark a queued
+        # repair imported merely because part of the album existed.
+        for record in records:
+            try:
+                await self._reconcile_request(record, library_mbids)
+            except Exception:
+                logger.warning("Could not refresh linked request status")
 
         task_ids = [r.download_task_id for r in records if r.download_task_id]
         reimportable: set[str] = (
@@ -438,11 +446,13 @@ class RequestsPageService:
                 await self._request_history.async_update_status(
                     record.musicbrainz_id, mapped, completed_at=completed_at
                 )
+                record.status = mapped
+                record.completed_at = completed_at
                 if mapped == "imported":
                     await self._notify_import(record)
             return
-        # No native task (older row, or an orphan flow): fall back to library presence.
-        await self._check_if_completed(record, library_mbids)
+        # Without a task or catalog coverage, album presence is not completion
+        # evidence. Preserve the request rather than inventing a successful import.
 
     async def _find_download_task(self, record: RequestHistoryRecord):
         if self._download_store is None:
@@ -554,23 +564,6 @@ class RequestsPageService:
             duration_seconds=record.duration_seconds,
             track_release_group_mbid=record.track_release_group_mbid,
         )
-
-    async def _check_if_completed(
-        self,
-        record: RequestHistoryRecord,
-        library_mbids: set[str],
-    ) -> bool:
-        # Album presence means at least one track exists. It must never finish a
-        # queued repair or turn a partial edition into a completed request.
-        task = await self._find_download_task(record)
-        if task is None or not self._task_is_complete(task):
-            return False
-        await self._request_history.async_update_status(
-            record.musicbrainz_id, "imported",
-            completed_at=datetime.now(timezone.utc).isoformat(),
-        )
-        await self._notify_import(record)
-        return True
 
     @staticmethod
     def _task_is_complete(task) -> bool:
