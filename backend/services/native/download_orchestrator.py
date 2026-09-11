@@ -1628,6 +1628,9 @@ class DownloadOrchestrator:
         # UI, but log expected_known so a 1/1 'completed' on an unmeasured album is
         # distinguishable from a genuine 1-track one.
         expected = raw_expected or present
+        if status == DownloadStatus.COMPLETED and raw_expected > present:
+            status = DownloadStatus.PARTIAL if present > 0 else DownloadStatus.FAILED
+            error_message = f"Only {present} of {raw_expected} expected tracks were imported."
         fields = {
             "completed_at": time.time(),
             "files_completed": present,

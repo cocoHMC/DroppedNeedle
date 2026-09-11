@@ -37,6 +37,7 @@ from models.library_management import (
     LibraryManagementImportFile,
     LibraryManagementImportResult,
 )
+from services.native.audio_validation import AudioValidationError, validate_audio
 from services.native.quality_tiers import tier_for, tier_rank
 from services.native.title_match import names_different_album, title_containment_score
 
@@ -1214,6 +1215,15 @@ class FileProcessor:
                     logger.warning("Could not compensate conversion hold %s", path.name)
             raise
 
+    async def _verify_audio(self, source: Path) -> None:
+        try:
+            await validate_audio(source)
+        except AudioValidationError as exc:
+            raise VerificationFailed(
+                str(exc), reason="corrupt" if exc.corrupt else "audio_validation_unavailable",
+                filename=source.name,
+            ) from exc
+
     async def _place_matched_file(
         self,
         manifest: DownloadManifest,
@@ -1224,6 +1234,7 @@ class FileProcessor:
         Duration already gated the match, so re-checking it here would be a tautology -
         AcoustID is the optional recording-identity backstop."""
         source, tag, info = candidate.path, candidate.tag, candidate.info
+        await self._verify_audio(source)
         target_tag = self._build_folder_target_tag(manifest, track, tag)
         target_path = self._library_paths[0] / self._naming.format_path(
             manifest.naming_template, target_tag, info.file_format
@@ -1795,6 +1806,8 @@ class FileProcessor:
                 reason=SOURCE_FILE_MISSING,
                 filename=expected.filename,
             )
+
+        await self._verify_audio(source)
 
         # mutagen is sync; wrap in to_thread, mirroring the scanner
         try:

@@ -446,6 +446,19 @@ async def test_process_task_autopicks_and_completes(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_completed_task_with_missing_expected_tracks_stays_partial(tmp_path: Path):
+    store, orch, *_ = _build(tmp_path, imported_rows=[{"file_path": "a"}])
+    task = await _new_task(store)
+    orch._expected_track_count = lambda _: 2
+    await orch._finalize(task, DownloadStatus.COMPLETED)
+    final = await store.get_task(task.id)
+    assert final.status == DownloadStatus.PARTIAL
+    assert final.files_completed == 1
+    assert final.files_total == 2
+    assert "1 of 2" in final.error_message
+
+
+@pytest.mark.asyncio
 async def test_completed_task_clears_error_from_failed_source(tmp_path: Path):
     store, orch, *_ = _build(tmp_path, imported_rows=[{"file_path": "a"}])
     task = await _new_task(store)
