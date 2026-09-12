@@ -18,8 +18,14 @@ export function derivedDownloadStatus(task: DownloadTask): DerivedDownloadStatus
 	return task.status;
 }
 
-// mirrors the backend _ACTIVE_STATUSES - a task still in flight (not a terminal state)
-const ACTIVE_STATUSES: DownloadStatus[] = ['queued', 'downloading', 'processing'];
+// A parked review is still an existing request, even when the REST API exposes
+// its derived status rather than its persisted queued value.
+const ACTIVE_STATUSES: DownloadStatus[] = [
+	'queued',
+	'awaiting_review',
+	'downloading',
+	'processing'
+];
 
 export function isActiveDownloadStatus(status: DownloadStatus): boolean {
 	return ACTIVE_STATUSES.includes(status);

@@ -439,6 +439,32 @@ class AuthService:
     async def list_sessions(self, user_id: str) -> list[TokenRecord]:
         return await self._store.list_tokens_for_user(user_id)
 
+    @staticmethod
+    def validate_device_session_name(device_name: str) -> str:
+        label = " ".join((device_name or "").split())
+        if not label or len(label) > 80:
+            raise AuthenticationError("Invalid device name")
+        return label
+
+    async def issue_device_session(self, user_id: str, device_name: str) -> str:
+        """Create a distinct, revocable session without copying the caller's token.
+
+        The authenticated caller already proved ownership of the account. The
+        bounded label is stored only as the session user-agent so the existing
+        session roster can identify and revoke the companion independently.
+        """
+        label = self.validate_device_session_name(device_name)
+        await self._require_user(user_id)
+        user_agent = f"Tonarr companion · {label}"
+        raw_token, token_hash = self._store.issue_token()
+        await self._store.replace_companion_token(
+            id=_new_id(),
+            user_id=user_id,
+            token_hash=token_hash,
+            user_agent=user_agent,
+        )
+        return raw_token
+
     async def revoke_session(self, token_id: str, requesting_user_id: str) -> None:
         tokens = await self._store.list_tokens_for_user(requesting_user_id)
         owned = any(token.id == token_id for token in tokens)

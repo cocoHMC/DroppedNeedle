@@ -586,13 +586,7 @@ class WantedWatcherService:
                 await self._fulfil(want)
                 return "satisfied"
             missing_tracks = uncovered_tracks(rows, tracks)
-        elif want.kind == "missing":
-            # tracklist unavailable: the library-presence semantic the requests
-            # page uses (§5.2.3.a) - never raw file-row counts
-            if await self._in_library(mbid):
-                await self._fulfil(want)
-                return "satisfied"
-        else:
+        elif want.kind != "missing":
             # a partial want without a tracklist can't be measured: fail open,
             # never search-spam on missing data (§5.2.3.a)
             await self._store.reschedule(
@@ -818,8 +812,14 @@ class WantedWatcherService:
 
     async def _tracklist(self, mbid: str) -> list | None:
         try:
-            info = await self._album_service.get_album_tracks_info(
+            selected = await self._album_service.get_album_tracks_info(
                 mbid, priority=RequestPriority.BACKGROUND_SYNC
+            )
+            release = getattr(selected, "selected_release_id", None)
+            if not release:
+                return None
+            info = await self._album_service.get_exact_edition_tracks_info(
+                mbid, release, priority=RequestPriority.BACKGROUND_SYNC
             )
         except Exception:  # noqa: BLE001 - coverage is fail-open (§5.2.3.a)
             return None
@@ -831,13 +831,6 @@ class WantedWatcherService:
             return await self._library.get_file_rows_for_album(mbid)
         except Exception:  # noqa: BLE001 - a rows failure reads as nothing held
             return []
-
-    async def _in_library(self, mbid: str) -> bool:
-        try:
-            mbids = await self._library.get_library_mbids(include_release_ids=False)
-        except Exception:  # noqa: BLE001 - presence check is best-effort
-            return False
-        return mbid.lower() in {str(m).lower() for m in mbids}
 
     async def _has_active_work(self, want: WantedWatch) -> bool:
         mbid = want.release_group_mbid

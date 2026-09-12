@@ -9,6 +9,7 @@ from api.v1.schemas.request import (
     BatchRequestResponse,
     RequestAcceptedResponse,
 )
+from api.v1.schemas.download import TrackRequestResponse
 from core.exceptions import ExternalServiceError, ValidationError
 from infrastructure.queue.priority_queue import RequestPriority
 from services.native.download_service import ALREADY_IN_LIBRARY
@@ -123,12 +124,18 @@ class RequestService:
             musicbrainz_id
         )
 
-        needs_approval = user_role == "user"
+        # Fail closed for any future or malformed role. Only the two roles the
+        # server explicitly grants acquisition authority may dispatch without
+        # owner review.
+        needs_approval = user_role not in ("trusted", "admin")
         initial_status = "awaiting_approval" if needs_approval else "pending"
 
         try:
             existing = await self._request_history.async_get_record(musicbrainz_id)
             if existing and existing.status in ("pending", "downloading"):
+                await self._request_history.async_add_requester(
+                    musicbrainz_id, user_id, requested_by_name
+                )
                 if monitor_artist and not existing.monitor_artist:
                     await self._request_history.async_update_monitoring_flags(
                         musicbrainz_id,
@@ -142,6 +149,9 @@ class RequestService:
                     status=existing.status,
                 )
             if existing and existing.status == "awaiting_approval":
+                await self._request_history.async_add_requester(
+                    musicbrainz_id, user_id, requested_by_name
+                )
                 return RequestAcceptedResponse(
                     success=True,
                     message="Request is awaiting admin approval",
@@ -233,11 +243,14 @@ class RequestService:
             raise ExternalServiceError(f"Failed to start download: {e}")
 
         if task_id == ALREADY_IN_LIBRARY:
+            await self._request_history.async_update_status(
+                musicbrainz_id, "completed", completed_at=datetime.now(timezone.utc).isoformat()
+            )
             return RequestAcceptedResponse(
                 success=True,
                 message="Album is already in the library",
                 musicbrainz_id=musicbrainz_id,
-                status="pending",
+                status="completed",
             )
 
         await self._request_history.async_update_download_task_id(
@@ -249,6 +262,115 @@ class RequestService:
             musicbrainz_id=musicbrainz_id,
             status="pending",
         )
+
+    async def request_track(
+        self,
+        recording_mbid: str,
+        *,
+        artist_name: str,
+        track_title: str,
+        album_title: str | None = None,
+        duration_seconds: int | None = None,
+        release_group_mbid: str | None = None,
+        artist_mbid: str | None = None,
+        release_mbid: str | None = None,
+        content_variant: str = "original",
+        user_id: str,
+        user_role: str,
+        requested_by_name: str | None = None,
+    ) -> TrackRequestResponse:
+        """Record an exact-track ask before dispatching it.
+
+        This deliberately shares the album approval gate. A normal user can
+        request one recording, but only a trusted user or an owner can start
+        acquisition without review. The previous route bypassed approval and
+        made exact-track requests less safe than whole-album requests.
+        """
+        if content_variant not in ("original", "clean"):
+            raise ValidationError("Unknown track content variant")
+        needs_approval = user_role not in ("trusted", "admin")
+        existing = await self._request_history.async_get_record(recording_mbid)
+        if existing and getattr(existing, "content_variant", "original") != content_variant:
+            raise ValidationError("This recording already has a different content request. Choose a verified distinct recording.")
+        if existing and existing.status in (
+            "awaiting_approval",
+            "pending",
+            "queued",
+            "downloading",
+        ):
+            await self._request_history.async_add_requester(
+                recording_mbid, user_id, requested_by_name
+            )
+            return TrackRequestResponse(
+                status=(
+                    "awaiting_approval"
+                    if existing.status == "awaiting_approval"
+                    else "queued"
+                ),
+                task_id=existing.download_task_id,
+            )
+
+        if self._quota is not None:
+            await self._quota.check_request_quota(user_id, user_role)
+            await self._quota.check_storage_admission(user_id, "user")
+
+        await self._request_history.async_record_request(
+            musicbrainz_id=recording_mbid,
+            artist_name=artist_name or "Unknown",
+            album_title=album_title or "Single track",
+            artist_mbid=artist_mbid,
+            user_id=user_id,
+            requested_by_name=requested_by_name,
+            release_mbid=release_mbid,
+            initial_status="awaiting_approval" if needs_approval else "pending",
+            request_kind="track",
+            track_title=track_title,
+            duration_seconds=duration_seconds,
+            track_release_group_mbid=release_group_mbid,
+            content_variant=content_variant,
+        )
+
+        if needs_approval:
+            logger.info(
+                "Exact-track request queued for approval: %s by user %s",
+                recording_mbid,
+                user_id,
+            )
+            return TrackRequestResponse(status="awaiting_approval")
+
+        try:
+            task_id = await self._acquisition.request_track(
+                user_id=user_id,
+                recording_mbid=recording_mbid,
+                artist_name=artist_name,
+                track_title=track_title,
+                album_title=album_title,
+                duration_seconds=duration_seconds,
+                release_group_mbid=release_group_mbid,
+                artist_mbid=artist_mbid,
+                release_mbid=release_mbid,
+                content_variant=content_variant,
+            )
+        except Exception:
+            await self._request_history.async_update_status(
+                recording_mbid,
+                "failed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            raise
+
+        if task_id == ALREADY_IN_LIBRARY:
+            await self._request_history.async_update_status(
+                recording_mbid,
+                "imported",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            return TrackRequestResponse(status="already_in_library")
+
+        await self._request_history.async_update_download_task_id(
+            recording_mbid, task_id
+        )
+        return TrackRequestResponse(status="queued", task_id=task_id)
 
     async def request_batch(
         self,
@@ -282,7 +404,7 @@ class RequestService:
             seen_mbids.add(canonical_key)
             items.append(item)
 
-        needs_approval = user_role == "user"
+        needs_approval = user_role not in ("trusted", "admin")
         initial_status = "awaiting_approval" if needs_approval else "pending"
 
         try:
@@ -290,6 +412,14 @@ class RequestService:
             new_items = [
                 item for item in items if item["musicbrainz_id"].lower() not in active
             ]
+            existing_items = [
+                item["musicbrainz_id"]
+                for item in items
+                if item["musicbrainz_id"].lower() in active
+            ]
+            await self._request_history.async_add_requesters(
+                existing_items, user_id, requested_by_name
+            )
             skipped = duplicate_count + len(items) - len(new_items)
 
             if not new_items:
@@ -298,6 +428,7 @@ class RequestService:
                     message="All albums already requested",
                     requested=0,
                     skipped=skipped,
+                    status="already_requested",
                 )
 
             # A batch of N counts as N asks (A4); over-quota rejects the WHOLE batch
@@ -324,6 +455,7 @@ class RequestService:
                     message="Batch request submitted, awaiting admin approval",
                     requested=len(new_items),
                     skipped=skipped,
+                    status="awaiting_approval",
                 )
 
             # auto-approve: dispatch each item through the native pipeline (mirrors
@@ -359,6 +491,10 @@ class RequestService:
                     await self._request_history.async_update_download_task_id(
                         mbid, task_id
                     )
+                else:
+                    await self._request_history.async_update_status(
+                        mbid, "completed", completed_at=datetime.now(timezone.utc).isoformat()
+                    )
                 dispatched += 1
 
             return BatchRequestResponse(
@@ -367,6 +503,7 @@ class RequestService:
                 requested=dispatched,
                 skipped=skipped,
                 overflow=0,
+                status="pending" if dispatched else "failed",
             )
         except (ExternalServiceError, ValidationError):
             raise
@@ -388,9 +525,21 @@ class RequestService:
         for mbid in musicbrainz_ids:
             try:
                 record = await self._request_history.async_get_record(mbid)
-                if not is_admin and (record is None or record.user_id != user_id):
-                    failed += 1
-                    continue
+                if not is_admin:
+                    if (
+                        record is None
+                        or not await self._request_history.async_is_requester(
+                            user_id or "", mbid
+                        )
+                    ):
+                        failed += 1
+                        continue
+                    if await self._request_history.async_requester_count(mbid) > 1:
+                        await self._request_history.async_remove_requester(
+                            user_id or "", mbid
+                        )
+                        cancelled += 1
+                        continue
                 # best-effort: a missing/non-cancellable task must not block marking
                 if record is not None and record.download_task_id:
                     try:

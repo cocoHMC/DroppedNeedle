@@ -2298,6 +2298,7 @@ export interface DismissReviewResponse {
 
 export type DownloadStatus =
 	| 'queued'
+	| 'awaiting_review'
 	| 'downloading'
 	| 'processing'
 	| 'completed'

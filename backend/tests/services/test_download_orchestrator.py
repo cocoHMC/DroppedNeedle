@@ -446,6 +446,19 @@ async def test_process_task_autopicks_and_completes(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_completed_task_with_missing_expected_tracks_stays_partial(tmp_path: Path):
+    store, orch, *_ = _build(tmp_path, imported_rows=[{"file_path": "a"}])
+    task = await _new_task(store)
+    orch._expected_track_count = lambda _: 2
+    await orch._finalize(task, DownloadStatus.COMPLETED)
+    final = await store.get_task(task.id)
+    assert final.status == DownloadStatus.PARTIAL
+    assert final.files_completed == 1
+    assert final.files_total == 2
+    assert "1 of 2" in final.error_message
+
+
+@pytest.mark.asyncio
 async def test_completed_task_clears_error_from_failed_source(tmp_path: Path):
     store, orch, *_ = _build(tmp_path, imported_rows=[{"file_path": "a"}])
     task = await _new_task(store)
@@ -3072,6 +3085,7 @@ async def test_coverage_mb_failure_fails_open_to_count_check(tmp_path: Path):
     # count check governs and the download completes exactly as before.
     album_service = MagicMock()
     album_service.get_album_tracks_info = AsyncMock(side_effect=RuntimeError("MB down"))
+    album_service.get_exact_edition_tracks_info = AsyncMock(side_effect=RuntimeError("MB down"))
     client = _StubClient(
         _status("completed", files_completed=1, succeeded=["peer/01.flac"])
     )
@@ -3303,3 +3317,20 @@ async def test_partial_album_and_completed_track_do_not_fulfil_wanted_watch(
     )
 
     wanted_store.mark_fulfilled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completion_uses_full_catalog_edition_not_local_partial_tracklist(tmp_path):
+    from types import SimpleNamespace
+    tracks = [_mb_track(i, title=f"Track {i}") for i in range(1, 11)]
+    albums = _album_service_with(tracks)
+    albums.get_album_tracks_info.return_value = SimpleNamespace(
+        tracks=tracks[:5], total_tracks=5, selected_release_mbid="release-1")
+    rows = [{"recording_mbid": f"recording-{i}", "track_number": i, "disc_number": 1}
+            for i in range(1, 6)]
+    _, orch, _, _ = _build(tmp_path, album_service=albums, imported_rows=rows)
+    task = SimpleNamespace(id="task", release_group_mbid="rg", release_mbid="release-1")
+    result = await orch._coverage(task, context="completeness")
+    assert result[:2] == (5, 10)
+    albums.get_exact_edition_tracks_info.assert_awaited_once()
+    albums.get_album_tracks_info.assert_not_awaited()

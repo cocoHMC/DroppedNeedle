@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from core.exceptions import (
     AutomaticManagementHoldError,
     ConfigurationError,
+    ExternalServiceError,
     PermissionDeniedError,
     ResourceNotFoundError,
     ValidationError,
@@ -45,6 +46,7 @@ from services.native.album_preflight_scorer import (
     rank_stored_candidates,
 )
 from services.native.download_orchestrator import DownloadOrchestrator
+from services.native.coverage import match_rows_to_tracks
 from services.native.library_manager import LibraryManager
 from services.native.quality_tiers import should_acquire, tier_for, tier_rank
 
@@ -209,16 +211,25 @@ class DownloadService:
             )
 
     async def _already_satisfied(
-        self, release_group_mbid: str, origin: str = "user"
+        self, release_group_mbid: str, origin: str = "user", release_mbid: str | None = None
     ) -> bool:
-        """True when the library already holds this album at a quality this request won't
-        improve on. Origin-aware (D18): only an ``origin='upgrade'`` request may treat a
-        below-cutoff held album as not-satisfied - replace-on-import fires only for
-        upgrades, so re-fetching for any other origin would download bytes that are then
-        skipped at placement. Every non-upgrade origin sees any held copy as satisfied."""
+        """A held quality tier does not establish a complete album.
+
+        Fill missing tracks through the normal request path; only explicit upgrades
+        may replace otherwise complete tracks with a higher-quality encoding.
+        """
         held = await self._library.album_quality_tier(release_group_mbid)
         if origin != "upgrade":
-            return held is not None
+            if held is None:
+                return False
+            if self._album_service is None:
+                return True  # Legacy callers without catalog resolution retain their gate.
+            _, tracks, _ = await self._resolve_acquisition_identity(
+                release_group_mbid, release_mbid
+            )
+            rows = await self._library.get_file_rows_for_album(release_group_mbid)
+            covered, _, _ = match_rows_to_tracks(rows, tracks)
+            return covered == len(tracks)
         if held is None:
             # An upgrade of nothing is not an upgrade: an un-held album must go
             # through the normal (quota/cap-checked) request path, never the
@@ -323,6 +334,17 @@ class DownloadService:
                     release_group_mbid,
                     priority=priority,
                 )
+                # The fast album page may contain only the tracks currently held.
+                # Acquisition must use the catalog edition's full tracklist.
+                selected = getattr(info, "selected_release_mbid", None)
+                if selected:
+                    info = await self._album_service.get_exact_edition_tracks_info(
+                        release_group_mbid, selected, priority=priority
+                    )
+        except ExternalServiceError:
+            # Preserve a retryable catalog outage; it says nothing about whether
+            # the exact edition exists. No task is created before identity resolves.
+            raise
         except Exception as error:  # noqa: BLE001 - fail closed before any task exists
             raise ValidationError(
                 "The exact MusicBrainz edition could not be verified. No download was started."
@@ -721,6 +743,7 @@ class DownloadService:
         origin: str = "user",
         release_mbid: str | None = None,
         release_track_mbid: str | None = None,
+        content_variant: str = "original",
     ) -> str:
         """Create a download task and dispatch the orchestrator. Returns the new
         task id, the existing active task id (dedup), or the ``already_in_library``
@@ -736,7 +759,7 @@ class DownloadService:
         # skipped for orphan-track requests, which download a track whose album
         # isn't in the library yet
         if download_type == "album" and await self._already_satisfied(
-            release_group_mbid, origin
+            release_group_mbid, origin, release_mbid
         ):
             return ALREADY_IN_LIBRARY
 
@@ -877,6 +900,7 @@ class DownloadService:
             track_count=track_count,
             track_duration_seconds=track_duration_seconds,
             origin=origin,
+            content_variant=content_variant,
         )
         self._orchestrator.dispatch(task.id)
         return task.id
@@ -894,10 +918,23 @@ class DownloadService:
         origin: str = "user",
         release_mbid: str | None = None,
         release_track_mbid: str | None = None,
+        content_variant: str = "original",
     ) -> str:
         """Request a single track. Orphan tracks (album not in the library) resolve
         the release group via MusicBrainz, auto-create the album folder, and download
         the one track; the album appears partially present."""
+        if content_variant == "clean":
+            if not recording_mbid or not release_group_mbid or not release_mbid:
+                raise ValidationError(
+                    "A clean request requires an exact MusicBrainz recording, "
+                    "release group, and release edition"
+                )
+            # This is server-owned replacement semantics; clients cannot select an
+            # arbitrary origin string to obtain destructive behavior.
+            origin = "clean_replacement"
+        elif content_variant != "original":
+            raise ValidationError("Unsupported content variant")
+
         if self._ownership is not None:
             recording_mbid = await self._ownership.provider_track_id(recording_mbid)
             if release_group_mbid is not None:
@@ -961,6 +998,7 @@ class DownloadService:
             origin=origin,
             release_mbid=release_mbid,
             release_track_mbid=release_track_mbid,
+            content_variant=content_variant,
         )
 
     @property

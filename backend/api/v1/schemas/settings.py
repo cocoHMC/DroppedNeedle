@@ -706,6 +706,10 @@ class ConnectAppsSettings(AppStruct):
 
     subsonic_enabled: bool = False
     jellyfin_enabled: bool = False
+    # Capability negotiation for clients that must distinguish the historical
+    # exact-track endpoint (which bypassed approval) from the approval-safe
+    # implementation. Older servers omit this field, so clients fail closed.
+    exact_track_approval_supported: bool = True
     transcoding_enabled: bool = True
     transcode_default_format: Literal["mp3", "opus"] = "mp3"
     transcode_max_bitrate_kbps: int = 320
@@ -714,6 +718,9 @@ class ConnectAppsSettings(AppStruct):
     discover_mode: Literal["local-only", "lazy-mb", "use-scrobble-targets"] = (
         "local-only"
     )
+    # Protocol capability advertised to clients. Older servers omit the field,
+    # allowing clients to fail closed instead of silently requesting an explicit copy.
+    clean_content_requests_supported: bool = True
 
     def __post_init__(self) -> None:
         if (

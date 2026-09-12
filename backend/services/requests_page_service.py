@@ -81,8 +81,8 @@ class RequestsPageService:
                 items.append(self._build_pending_item(record))
                 continue
 
-            completed = await self._check_if_completed(record, library_mbids)
-            if completed:
+            await self._reconcile_request(record, library_mbids)
+            if record.status == "imported":
                 continue
             items.append(self._build_pending_item(record))
 
@@ -110,6 +110,14 @@ class RequestsPageService:
             )
 
         library_mbids = await self._fetch_library_mbids()
+
+        # Reconcile historical rows too: older versions could mark a queued
+        # repair imported merely because part of the album existed.
+        for record in records:
+            try:
+                await self._reconcile_request(record, library_mbids)
+            except Exception:
+                logger.warning("Could not refresh linked request status")
 
         task_ids = [r.download_task_id for r in records if r.download_task_id]
         reimportable: set[str] = (
@@ -141,6 +149,10 @@ class RequestsPageService:
                 download_task_id=r.download_task_id,
                 can_reimport=r.status == "failed"
                 and r.download_task_id in reimportable,
+                request_kind=r.request_kind,
+                track_title=r.track_title,
+                duration_seconds=r.duration_seconds,
+                track_release_group_mbid=r.track_release_group_mbid,
             )
             for r in records
         ]
@@ -181,17 +193,7 @@ class RequestsPageService:
         # (the 'already_in_library' sentinel is guarded)
         if self._acquisition is not None:
             try:
-                task_id = await self._acquisition.request_album(
-                    user_id=record.user_id or "",
-                    release_group_mbid=musicbrainz_id,
-                    artist_name=record.artist_name or "Unknown",
-                    album_title=record.album_title or "Unknown",
-                    year=record.year,
-                    artist_mbid=record.artist_mbid,
-                    origin="user",
-                    release_mbid=record.release_mbid,
-                    track_count_priority=RequestPriority.USER_INITIATED,
-                )
+                task_id = await self._dispatch_record(record, origin="user")
             except ValidationError as e:
                 # A cap/quota rejection (Feature C) is not a failure of the request:
                 # put it BACK in the approval queue (it would otherwise silently
@@ -211,7 +213,7 @@ class RequestsPageService:
                 )
                 return CancelRequestResponse(
                     success=False,
-                    message=f"Approved but failed to start: {record.album_title}",
+                    message=f"Approved but failed to start: {self._record_title(record)}",
                 )
             from services.native.download_service import ALREADY_IN_LIBRARY
 
@@ -219,8 +221,14 @@ class RequestsPageService:
                 await self._request_history.async_update_download_task_id(
                     musicbrainz_id, task_id
                 )
+            else:
+                await self._request_history.async_update_status(
+                    musicbrainz_id,
+                    "imported",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
         return CancelRequestResponse(
-            success=True, message=f"Approved: {record.album_title}"
+            success=True, message=f"Approved: {self._record_title(record)}"
         )
 
     async def reject_request(
@@ -239,7 +247,7 @@ class RequestsPageService:
             musicbrainz_id, "rejected", reviewer_id, reviewer_name, completed_at=now_iso
         )
         return CancelRequestResponse(
-            success=True, message=f"Rejected: {record.album_title}"
+            success=True, message=f"Rejected: {self._record_title(record)}"
         )
 
     async def cancel_request(
@@ -248,8 +256,22 @@ class RequestsPageService:
         record = await self._request_history.async_get_record(musicbrainz_id)
         if not record:
             return CancelRequestResponse(success=False, message="Request not found")
-        if user_role != "admin" and record.user_id != user_id:
-            raise PermissionDeniedError("Cannot cancel another user's request")
+        if user_role != "admin":
+            if not await self._request_history.async_is_requester(
+                user_id, musicbrainz_id
+            ):
+                raise PermissionDeniedError("Cannot cancel another user's request")
+            if await self._request_history.async_requester_count(musicbrainz_id) > 1:
+                await self._request_history.async_remove_requester(
+                    user_id, musicbrainz_id
+                )
+                return CancelRequestResponse(
+                    success=True,
+                    message=(
+                        "Removed from your requests. The shared server request "
+                        "continues for another listener."
+                    ),
+                )
 
         # awaiting_approval requests never dispatched, cancel directly
         if record.status == "awaiting_approval":
@@ -259,7 +281,7 @@ class RequestsPageService:
             )
             return CancelRequestResponse(
                 success=True,
-                message=f"Cancelled request for {record.album_title}",
+                message=f"Cancelled request for {self._record_title(record)}",
             )
 
         if record.status not in _CANCELLABLE_STATUSES:
@@ -293,7 +315,7 @@ class RequestsPageService:
 
         return CancelRequestResponse(
             success=True,
-            message=f"Cancelled download of {record.album_title}",
+            message=f"Cancelled download of {self._record_title(record)}",
         )
 
     async def retry_request(
@@ -302,7 +324,9 @@ class RequestsPageService:
         record = await self._request_history.async_get_record(musicbrainz_id)
         if not record:
             return RetryRequestResponse(success=False, message="Request not found")
-        if user_role != "admin" and record.user_id != user_id:
+        if user_role != "admin" and not await self._request_history.async_is_requester(
+            user_id, musicbrainz_id
+        ):
             raise PermissionDeniedError("Cannot retry another user's request")
 
         if record.status not in _RETRYABLE_STATUSES:
@@ -319,16 +343,11 @@ class RequestsPageService:
             await self._request_history.async_update_status(musicbrainz_id, "pending")
             # A retry re-dispatches an already-recorded ask, so it is not a new
             # user request for quota purposes (CollectionManagement D20).
-            task_id = await self._acquisition.request_album(
-                user_id=record.user_id or user_id or "",
-                release_group_mbid=musicbrainz_id,
-                artist_name=record.artist_name or "Unknown",
-                album_title=record.album_title or "Unknown",
-                year=record.year,
-                artist_mbid=record.artist_mbid,
+            task_id = await self._dispatch_record(
+                record,
                 origin="retry",
-                release_mbid=record.release_mbid,
-                track_count_priority=RequestPriority.USER_INITIATED,
+                fallback_user_id=user_id,
+                user_id_override=user_id if user_role != "admin" else None,
             )
         except ValidationError as e:
             # cap/quota rejection: restore the pre-retry status (don't strand it as
@@ -347,8 +366,14 @@ class RequestsPageService:
             await self._request_history.async_update_download_task_id(
                 musicbrainz_id, task_id
             )
+        else:
+            await self._request_history.async_update_status(
+                musicbrainz_id,
+                "imported",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
         return RetryRequestResponse(
-            success=True, message=f"Re-requested {record.album_title}"
+            success=True, message=f"Re-requested {self._record_title(record)}"
         )
 
     async def clear_history_item(
@@ -359,7 +384,9 @@ class RequestsPageService:
             return False
         # ownership checked before clearability so a non-owner gets 403, not a
         # misleading 200/False, on another user's row
-        if user_role != "admin" and record.user_id != user_id:
+        if user_role != "admin" and not await self._request_history.async_is_requester(
+            user_id, musicbrainz_id
+        ):
             raise PermissionDeniedError("Cannot clear another user's request")
         if record.status not in _CLEARABLE_STATUSES:
             return False
@@ -374,6 +401,8 @@ class RequestsPageService:
 
     # download_task.status -> request_history.status
     _TASK_TO_REQUEST_STATUS = {
+        "queued": "pending",
+        "searching": "downloading",
         "downloading": "downloading",
         "processing": "downloading",
         "completed": "imported",
@@ -406,6 +435,8 @@ class RequestsPageService:
         task = await self._find_download_task(record)
         if task is not None:
             mapped = self._TASK_TO_REQUEST_STATUS.get(task.status)
+            if mapped == "imported" and not self._task_is_complete(task):
+                mapped = "incomplete"
             if mapped and mapped != record.status:
                 completed_at = (
                     datetime.now(timezone.utc).isoformat()
@@ -415,11 +446,13 @@ class RequestsPageService:
                 await self._request_history.async_update_status(
                     record.musicbrainz_id, mapped, completed_at=completed_at
                 )
+                record.status = mapped
+                record.completed_at = completed_at
                 if mapped == "imported":
                     await self._notify_import(record)
             return
-        # No native task (older row, or an orphan flow): fall back to library presence.
-        await self._check_if_completed(record, library_mbids)
+        # Without a task or catalog coverage, album presence is not completion
+        # evidence. Preserve the request rather than inventing a successful import.
 
     async def _find_download_task(self, record: RequestHistoryRecord):
         if self._download_store is None:
@@ -453,8 +486,56 @@ class RequestsPageService:
                 return self._library_mbids_cache
             return set()
 
+    async def _dispatch_record(
+        self,
+        record: RequestHistoryRecord,
+        *,
+        origin: str,
+        fallback_user_id: str = "",
+        user_id_override: str | None = None,
+    ) -> str:
+        """Dispatch an approved/retried request without widening exact tracks."""
+        user_id = user_id_override or record.user_id or fallback_user_id
+        if record.request_kind == "track":
+            if not record.track_title:
+                raise ValidationError("Exact-track request is missing its track title")
+            return await self._acquisition.request_track(
+                user_id=user_id,
+                recording_mbid=record.musicbrainz_id,
+                artist_name=record.artist_name or "Unknown",
+                track_title=record.track_title,
+                album_title=record.album_title,
+                duration_seconds=record.duration_seconds,
+                release_group_mbid=record.track_release_group_mbid,
+                artist_mbid=record.artist_mbid,
+                release_mbid=record.release_mbid,
+                content_variant=getattr(record, "content_variant", "original"),
+            )
+        return await self._acquisition.request_album(
+            user_id=user_id,
+            release_group_mbid=record.musicbrainz_id,
+            artist_name=record.artist_name or "Unknown",
+            album_title=record.album_title or "Unknown",
+            year=record.year,
+            artist_mbid=record.artist_mbid,
+            origin=origin,
+            release_mbid=record.release_mbid,
+            track_count_priority=RequestPriority.USER_INITIATED,
+        )
+
+    @staticmethod
+    def _record_title(record: RequestHistoryRecord) -> str:
+        if record.request_kind == "track" and record.track_title:
+            return record.track_title
+        return record.album_title
+
     @staticmethod
     def _build_pending_item(record: RequestHistoryRecord) -> ActiveRequestItem:
+        cover_mbid = (
+            record.track_release_group_mbid
+            if record.request_kind == "track" and record.track_release_group_mbid
+            else record.musicbrainz_id
+        )
         return ActiveRequestItem(
             musicbrainz_id=record.musicbrainz_id,
             artist_name=record.artist_name,
@@ -462,7 +543,7 @@ class RequestsPageService:
             artist_mbid=record.artist_mbid,
             year=record.year,
             cover_url=prefer_release_group_cover_url(
-                record.musicbrainz_id,
+                cover_mbid,
                 record.cover_url,
                 size=500,
             ),
@@ -478,23 +559,17 @@ class RequestsPageService:
             library_queue_id=None,
             user_id=record.user_id,
             requested_by_name=record.requested_by_name,
+            request_kind=record.request_kind,
+            track_title=record.track_title,
+            duration_seconds=record.duration_seconds,
+            track_release_group_mbid=record.track_release_group_mbid,
         )
 
-    async def _check_if_completed(
-        self,
-        record: RequestHistoryRecord,
-        library_mbids: set[str],
-    ) -> bool:
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        if record.musicbrainz_id.lower() in library_mbids:
-            await self._request_history.async_update_status(
-                record.musicbrainz_id, "imported", completed_at=now_iso
-            )
-            await self._notify_import(record)
-            return True
-
-        return False
+    @staticmethod
+    def _task_is_complete(task) -> bool:
+        total = getattr(task, "files_total", 0) or 0
+        completed = getattr(task, "files_completed", 0) or 0
+        return task.status == "completed" and total > 0 and completed >= total
 
     async def _notify_import(self, record: RequestHistoryRecord) -> None:
         self._library_mbids_cache = None

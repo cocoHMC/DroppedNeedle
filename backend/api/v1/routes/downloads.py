@@ -75,6 +75,7 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         user_id=task.user_id,
         download_type=task.download_type,
         source=task.source,
+        content_variant=task.content_variant,
         release_group_mbid=task.release_group_mbid,
         release_mbid=task.release_mbid,
         release_track_mbid=task.release_track_mbid,
@@ -84,7 +85,15 @@ def _to_response(  # noqa: ANN001 - DownloadTask
         album_title=task.album_title,
         track_title=task.track_title,
         year=task.year,
-        status=task.status,
+        # A parked manual-source choice stays queued in persistence. Return the
+        # same review state as SSE so polling/native clients do not wait forever.
+        status=(
+            "awaiting_review"
+            if task.status == "queued"
+            and task.search_job_id is not None
+            and task.candidate_index is None
+            else task.status
+        ),
         progress_percent=task.progress_percent,
         total_size_bytes=task.total_size_bytes,
         downloaded_bytes=task.downloaded_bytes,

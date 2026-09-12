@@ -123,6 +123,7 @@ def env(tmp_path) -> _Env:
     library.get_library_mbids.return_value = set()
     album_service = AsyncMock()
     album_service.get_album_tracks_info.side_effect = ResourceNotFoundError("MB down")
+    album_service.get_exact_edition_tracks_info.side_effect = lambda *a, **kw: album_service.get_album_tracks_info.return_value
     mb = AsyncMock()
     first_release_date = (datetime.now(timezone.utc) - timedelta(days=13)).strftime(
         "%Y-%m-%d"
@@ -534,7 +535,7 @@ async def test_partial_want_dispatches_missing_tracks_capped_with_logged_drop(
     tracks = [_track(f"rec-{i}", f"Track {i}", i) for i in range(1, 9)]  # 8 expected
     env.album_service.get_album_tracks_info.side_effect = None
     env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
-        tracks=tracks
+        selected_release_id="edition-1", tracks=tracks
     )
     env.library.get_file_rows_for_album.return_value = [_row("rec-1")]  # 1 of 8 held
     env.ds.scout_album.return_value = [_cand(tier="auto")]
@@ -612,7 +613,7 @@ async def test_covered_want_fulfils_without_searching(env):
     tracks = [_track("rec-1", "One", 1), _track("rec-2", "Two", 2)]
     env.album_service.get_album_tracks_info.side_effect = None
     env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
-        tracks=tracks
+        selected_release_id="edition-1", tracks=tracks
     )
     env.library.get_file_rows_for_album.return_value = [
         _row("rec-1", 1),
@@ -631,12 +632,12 @@ async def test_covered_want_fulfils_without_searching(env):
 
 
 @pytest.mark.asyncio
-async def test_missing_want_without_tracklist_uses_library_presence(env):
+async def test_missing_want_without_tracklist_does_not_claim_presence_is_complete(env):
     await _add_watch(env)  # no tracklist by default
     env.library.get_library_mbids.return_value = {"rg-1"}
     summary = await env.watcher.run_sweep()
-    assert summary.fulfilled == 1
-    env.ds.scout_album.assert_not_awaited()
+    assert summary.fulfilled == 0
+    assert (await env.store.get_watch("rg-1")).state != "fulfilled"
 
 
 # --- active-work guards (§4.9) ---
@@ -925,3 +926,20 @@ async def test_scout_configuration_error_reschedules_quietly(env):
     watch = await env.store.get_watch("rg-1")
     assert watch.last_outcome is None
     assert watch.next_check_at > time.time()
+
+
+@pytest.mark.asyncio
+async def test_local_partial_tracklist_cannot_fulfil_full_catalog_edition(env):
+    await _add_watch(env)
+    one = _track("rec-1", "One", 1)
+    two = _track("rec-2", "Two", 2)
+    env.album_service.get_album_tracks_info.side_effect = None
+    env.album_service.get_album_tracks_info.return_value = SimpleNamespace(
+        selected_release_id="edition-1", tracks=[one])
+    env.album_service.get_exact_edition_tracks_info.side_effect = None
+    env.album_service.get_exact_edition_tracks_info.return_value = SimpleNamespace(tracks=[one, two])
+    env.library.get_file_rows_for_album.return_value = [_row("rec-1", 1)]
+    summary = await env.watcher.run_sweep()
+    assert summary.fulfilled == 0
+    assert (await env.store.get_watch("rg-1")).state != "fulfilled"
+    env.album_service.get_exact_edition_tracks_info.assert_awaited_once()

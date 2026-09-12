@@ -3,6 +3,7 @@ from pydantic import Field, TypeAdapter, ValidationError as PydanticValidationEr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Self
 import logging
+import os
 import msgspec
 from core.exceptions import ConfigurationError
 from infrastructure.file_utils import atomic_write_json, read_json
@@ -63,6 +64,12 @@ class Settings(BaseSettings):
     contact_email: str = Field(
         default="contact@droppedneedle.com",
         description="Contact email for MusicBrainz API User-Agent. Override with your own if desired."
+    )
+    http_user_agent: str | None = Field(
+        default=None,
+        max_length=512,
+        pattern=r"^[\x20-\x7E]*$",
+        description="Optional truthful application/version and contact identification for maintained integrations. Does not change provider rate limits.",
     )
     discover_warmer_enabled: bool = Field(
         default=True,
@@ -157,8 +164,12 @@ class Settings(BaseSettings):
         return self
     
     def get_user_agent(self) -> str:
+        if self.http_user_agent and self.http_user_agent.strip():
+            return self.http_user_agent.strip()
+        version = os.environ.get("COMMIT_TAG", "").strip() or "dev"
         id_part = self.instance_id[:8] if self.instance_id else "unknown"
-        return f"DroppedNeedle/1.0 ({id_part}; {self.contact_email}; https://www.droppedneedle.com)"
+        email = (self.contact_email or "").strip() or "contact@droppedneedle.com"
+        return f"DroppedNeedleApp/{version} ({id_part}; {email}; https://www.droppedneedle.com)"
 
     def load_from_file(self) -> None:
         if not self.config_file_path.exists():

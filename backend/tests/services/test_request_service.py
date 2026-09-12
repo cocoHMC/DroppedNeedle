@@ -17,9 +17,15 @@ def _make_service() -> tuple[RequestService, MagicMock, MagicMock]:
     request_history.async_update_status = AsyncMock()
     request_history.async_update_download_task_id = AsyncMock()
     request_history.async_bulk_record_requests = AsyncMock()
+    request_history.async_add_requester = AsyncMock()
+    request_history.async_add_requesters = AsyncMock()
+    request_history.async_is_requester = AsyncMock(return_value=True)
+    request_history.async_requester_count = AsyncMock(return_value=1)
+    request_history.async_remove_requester = AsyncMock(return_value=True)
     request_history.async_get_active_mbids = AsyncMock(return_value=set())
     request_history.async_get_requested_mbids = AsyncMock(return_value=set())
     download_service.request_album = AsyncMock(return_value="task-1")
+    download_service.request_track = AsyncMock(return_value="track-task-1")
     download_service.cancel_task = AsyncMock()
 
     get_ds = lambda: download_service  # noqa: E731
@@ -96,6 +102,7 @@ async def test_request_album_canonicalizes_release_alias_before_history_and_disp
         origin="user",
         release_mbid="release-edition",
         release_track_mbid=None,
+        content_variant="original",
     )
 
 
@@ -140,6 +147,106 @@ async def test_request_album_user_role_awaits_approval_without_dispatch():
 
 
 @pytest.mark.asyncio
+async def test_existing_request_is_attributed_to_each_listener_without_redispatch():
+    service, request_history, download_service = _make_service()
+    request_history.async_get_record.return_value = SimpleNamespace(
+        status="pending", monitor_artist=False
+    )
+
+    response = await service.request_album(
+        "rg-123",
+        user_id="listener-2",
+        user_role="user",
+        requested_by_name="Second listener",
+    )
+
+    assert response.status == "pending"
+    request_history.async_add_requester.assert_awaited_once_with(
+        "rg-123", "listener-2", "Second listener"
+    )
+    download_service.request_album.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_track_user_role_records_exact_metadata_and_awaits_approval():
+    service, request_history, download_service = _make_service()
+
+    response = await service.request_track(
+        "recording-1",
+        user_id="listener-1",
+        user_role="user",
+        requested_by_name="Listener",
+        artist_name="Radiohead",
+        track_title="Airbag",
+        album_title="OK Computer",
+        duration_seconds=287,
+        release_group_mbid="release-group-1",
+        artist_mbid="artist-1",
+        release_mbid="release-1",
+    )
+
+    assert response.status == "awaiting_approval"
+    download_service.request_track.assert_not_awaited()
+    request_history.async_record_request.assert_awaited_once_with(
+        musicbrainz_id="recording-1",
+        artist_name="Radiohead",
+        album_title="OK Computer",
+        artist_mbid="artist-1",
+        user_id="listener-1",
+        requested_by_name="Listener",
+        release_mbid="release-1",
+        initial_status="awaiting_approval",
+        request_kind="track",
+        track_title="Airbag",
+        duration_seconds=287,
+        track_release_group_mbid="release-group-1",
+        content_variant="original",
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_track_unknown_role_fails_closed_to_owner_approval():
+    service, request_history, download_service = _make_service()
+
+    response = await service.request_track(
+        "recording-unknown-role",
+        user_id="future-role-1",
+        user_role="future-role",
+        artist_name="Radiohead",
+        track_title="Airbag",
+    )
+
+    assert response.status == "awaiting_approval"
+    download_service.request_track.assert_not_awaited()
+    assert (
+        request_history.async_record_request.await_args.kwargs["initial_status"]
+        == "awaiting_approval"
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_track_trusted_dispatches_exact_recording_and_links_task():
+    service, request_history, download_service = _make_service()
+
+    response = await service.request_track(
+        "recording-1",
+        user_id="trusted-1",
+        user_role="trusted",
+        artist_name="Radiohead",
+        track_title="Airbag",
+        album_title="OK Computer",
+        release_group_mbid="release-group-1",
+    )
+
+    assert response.status == "queued"
+    assert response.task_id == "track-task-1"
+    download_service.request_track.assert_awaited_once()
+    request_history.async_update_download_task_id.assert_awaited_once_with(
+        "recording-1", "track-task-1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_request_album_already_in_library_not_linked_as_task_id():
     service, request_history, download_service = _make_service()
     download_service.request_album = AsyncMock(return_value="already_in_library")
@@ -148,6 +255,9 @@ async def test_request_album_already_in_library_not_linked_as_task_id():
 
     assert response.success is True
     assert response.message == "Album is already in the library"
+    assert response.status == "completed"
+    request_history.async_update_status.assert_awaited_once()
+    assert request_history.async_update_status.call_args.args == ("rg-123", "completed")
     request_history.async_update_download_task_id.assert_not_awaited()
 
 
@@ -296,6 +406,7 @@ async def test_request_batch_does_not_overwrite_an_approval_pending_request():
 
     assert response.requested == 0
     assert response.skipped == 1
+    assert response.status == "already_requested"
     request_history.async_bulk_record_requests.assert_not_awaited()
     download_service.request_album.assert_not_awaited()
 
@@ -310,6 +421,7 @@ async def test_request_batch_user_role_awaits_approval_without_dispatch():
     resp = await service.request_batch(items, user_role="user", user_id="u1")
 
     assert "approval" in resp.message.lower()
+    assert resp.status == "awaiting_approval"
     download_service.request_album.assert_not_awaited()
 
 
@@ -355,6 +467,9 @@ async def test_cancel_batch_user_only_cancels_owned_requests():
     }
     request_history.async_get_record = AsyncMock(
         side_effect=lambda mbid: records.get(mbid)
+    )
+    request_history.async_is_requester = AsyncMock(
+        side_effect=lambda _user_id, mbid: mbid == "rg-mine"
     )
 
     response = await service.cancel_batch(["rg-mine", "rg-theirs"], user_id="alice")
@@ -437,6 +552,7 @@ async def test_request_batch_quota_counts_only_new_items():
 
     assert response.success is True
     assert quota.check_request_quota.await_args.args == ("u1", "user", 1)
+    request_history.async_add_requesters.assert_awaited_once_with(["RG-1"], "u1", None)
 
 
 @pytest.mark.asyncio
@@ -486,3 +602,28 @@ async def test_request_album_resolves_download_service_per_dispatch():
 
     ds_a.request_album.assert_awaited_once()  # first dispatch used the original engine
     ds_b.request_album.assert_awaited_once()  # second used the NEW one (fails if captured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["user", "admin"])
+async def test_track_route_content_variant_survives_approval_boundary(role):
+    service, history, downloads = _make_service()
+    response = await service.request_track("clean-recording", artist_name="Artist", track_title="Clean song", user_id="listener", user_role=role, content_variant="clean")
+    assert history.async_record_request.await_args.kwargs["content_variant"] == "clean"
+    if role == "user":
+        assert response.status == "awaiting_approval"
+        downloads.request_track.assert_not_awaited()
+    else:
+        assert response.status == "queued"
+        assert downloads.request_track.await_args.kwargs["content_variant"] == "clean"
+
+
+@pytest.mark.asyncio
+async def test_clean_request_does_not_reuse_unverified_original_request():
+    service, history, downloads = _make_service()
+    history.async_get_record.return_value = SimpleNamespace(status="pending", content_variant="original")
+    from core.exceptions import ValidationError
+    with pytest.raises(ValidationError):
+        await service.request_track("recording", artist_name="Artist", track_title="Song", user_id="listener", user_role="admin", content_variant="clean")
+    downloads.request_track.assert_not_awaited()
+    history.async_add_requester.assert_not_awaited()

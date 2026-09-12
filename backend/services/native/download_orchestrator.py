@@ -1466,9 +1466,21 @@ class DownloadOrchestrator:
         if self._album_service is None or not task.release_group_mbid:
             return None
         try:
-            info = await self._album_service.get_album_tracks_info(
-                task.release_group_mbid, priority=RequestPriority.BACKGROUND_SYNC
-            )
+            if task.release_mbid:
+                info = await self._album_service.get_exact_edition_tracks_info(
+                    task.release_group_mbid, task.release_mbid,
+                    priority=RequestPriority.BACKGROUND_SYNC,
+                )
+            else:
+                info = await self._album_service.get_album_tracks_info(
+                    task.release_group_mbid, priority=RequestPriority.BACKGROUND_SYNC
+                )
+                selected = getattr(info, "selected_release_mbid", None)
+                if selected:
+                    info = await self._album_service.get_exact_edition_tracks_info(
+                        task.release_group_mbid, selected,
+                        priority=RequestPriority.BACKGROUND_SYNC,
+                    )
         except Exception:  # noqa: BLE001 - MB failure must never block completion
             logger.warning(
                 "coverage.tracklist_unavailable",
@@ -1628,6 +1640,9 @@ class DownloadOrchestrator:
         # UI, but log expected_known so a 1/1 'completed' on an unmeasured album is
         # distinguishable from a genuine 1-track one.
         expected = raw_expected or present
+        if status == DownloadStatus.COMPLETED and raw_expected > present:
+            status = DownloadStatus.PARTIAL if present > 0 else DownloadStatus.FAILED
+            error_message = f"Only {present} of {raw_expected} expected tracks were imported."
         fields = {
             "completed_at": time.time(),
             "files_completed": present,
@@ -2169,6 +2184,8 @@ class DownloadOrchestrator:
         manifest = DownloadManifest(
             task_id=task.id,
             source_username=candidate.username,
+            origin=task.origin,
+            content_variant=task.content_variant,
             release_group_mbid=task.release_group_mbid,
             release_mbid=release_mbid,
             artist_mbid=task.artist_mbid,

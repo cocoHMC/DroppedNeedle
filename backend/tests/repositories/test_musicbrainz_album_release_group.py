@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from core.exceptions import ExternalServiceError
 from models.album import AlbumInfo
 from repositories.musicbrainz_album import MusicBrainzAlbumMixin
 
@@ -72,8 +73,9 @@ async def test_fetch_rg_negative_caches_404_but_not_transient(monkeypatch):
     repo._cache.set.assert_awaited_once_with("ck-404", {}, ttl_seconds=600)
 
     repo._cache.set.reset_mock()
-    monkeypatch.setattr(mod, "mb_api_get", AsyncMock(side_effect=RuntimeError("503")))
-    assert await repo._fetch_release_group_by_id("rg-503", ["artist-credits"], "ck-503") is None
+    monkeypatch.setattr(mod, "mb_api_get", AsyncMock(side_effect=ExternalServiceError("503")))
+    with pytest.raises(ExternalServiceError, match="temporarily unavailable"):
+        await repo._fetch_release_group_by_id("rg-503", ["artist-credits"], "ck-503")
     repo._cache.set.assert_not_called()
 
 

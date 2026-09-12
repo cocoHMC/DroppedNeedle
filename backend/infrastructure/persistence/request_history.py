@@ -22,6 +22,19 @@ _REIMPORTABLE_CONDITION = (
     ")"
 )
 
+_REIMPORTABLE_JOIN_CONDITION = (
+    "rh.status = 'failed'"
+    " AND rh.download_task_id IS NOT NULL"
+    " AND EXISTS ("
+    "SELECT 1 FROM download_tasks"
+    " WHERE download_tasks.id = rh.download_task_id"
+    " AND download_tasks.status IN ('failed', 'partial')"
+    " AND download_tasks.source_username IS NOT NULL"
+    " AND download_tasks.search_job_id IS NOT NULL"
+    " AND download_tasks.candidate_index IS NOT NULL"
+    ")"
+)
+
 
 class RequestHistoryRecord(msgspec.Struct):
     musicbrainz_id: str
@@ -42,6 +55,11 @@ class RequestHistoryRecord(msgspec.Struct):
     reviewed_by_id: str | None = None
     reviewed_by_name: str | None = None
     reviewed_at: str | None = None
+    request_kind: str = "album"
+    track_title: str | None = None
+    duration_seconds: int | None = None
+    track_release_group_mbid: str | None = None
+    content_variant: str = "original"
 
 
 class RequestHistoryStore:
@@ -97,6 +115,11 @@ class RequestHistoryStore:
                 ("reviewed_at", "TEXT"),
                 ("download_task_id", "TEXT"),
                 ("release_mbid", "TEXT"),
+                ("request_kind", "TEXT NOT NULL DEFAULT 'album'"),
+                ("track_title", "TEXT"),
+                ("duration_seconds", "INTEGER"),
+                ("track_release_group_mbid", "TEXT"),
+                ("content_variant", "TEXT NOT NULL DEFAULT 'original'"),
             ]:
                 try:
                     conn.execute(
@@ -113,6 +136,31 @@ class RequestHistoryStore:
                     dismissed_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (user_id, musicbrainz_id_lower)
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_history_requesters (
+                    user_id TEXT NOT NULL,
+                    musicbrainz_id_lower TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    requested_by_name TEXT,
+                    PRIMARY KEY (user_id, musicbrainz_id_lower)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_request_history_requesters_mbid "
+                "ON request_history_requesters(musicbrainz_id_lower)"
+            )
+            # Preserve ownership of rows created before multi-listener attribution.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO request_history_requesters (
+                    user_id, musicbrainz_id_lower, requested_at, requested_by_name
+                )
+                SELECT user_id, musicbrainz_id_lower, requested_at, requested_by_name
+                FROM request_history WHERE user_id IS NOT NULL
                 """
             )
             conn.commit()
@@ -154,7 +202,11 @@ class RequestHistoryStore:
             artist_mbid=row["artist_mbid"],
             year=row["year"],
             cover_url=row["cover_url"],
-            requested_at=row["requested_at"],
+            requested_at=(
+                row["requester_requested_at"]
+                if "requester_requested_at" in keys
+                else row["requested_at"]
+            ),
             completed_at=row["completed_at"],
             status=row["status"],
             download_task_id=row["download_task_id"]
@@ -166,16 +218,34 @@ class RequestHistoryStore:
             auto_download_artist=bool(row["auto_download_artist"])
             if row["auto_download_artist"] is not None
             else False,
-            user_id=row["user_id"] if "user_id" in keys else None,
-            requested_by_name=row["requested_by_name"]
-            if "requested_by_name" in keys
-            else None,
+            user_id=(
+                row["requester_user_id"]
+                if "requester_user_id" in keys
+                else (row["user_id"] if "user_id" in keys else None)
+            ),
+            requested_by_name=(
+                row["requester_name"]
+                if "requester_name" in keys
+                else (row["requested_by_name"] if "requested_by_name" in keys else None)
+            ),
             release_mbid=row["release_mbid"] if "release_mbid" in keys else None,
             reviewed_by_id=row["reviewed_by_id"] if "reviewed_by_id" in keys else None,
             reviewed_by_name=row["reviewed_by_name"]
             if "reviewed_by_name" in keys
             else None,
             reviewed_at=row["reviewed_at"] if "reviewed_at" in keys else None,
+            request_kind=(row["request_kind"] if "request_kind" in keys else "album")
+            or "album",
+            content_variant=(row["content_variant"] if "content_variant" in keys else "original") or "original",
+            track_title=row["track_title"] if "track_title" in keys else None,
+            duration_seconds=(
+                row["duration_seconds"] if "duration_seconds" in keys else None
+            ),
+            track_release_group_mbid=(
+                row["track_release_group_mbid"]
+                if "track_release_group_mbid" in keys
+                else None
+            ),
         )
 
     async def async_record_request(
@@ -192,6 +262,11 @@ class RequestHistoryStore:
         requested_by_name: str | None = None,
         release_mbid: str | None = None,
         initial_status: str = "pending",
+        request_kind: str = "album",
+        track_title: str | None = None,
+        duration_seconds: int | None = None,
+        track_release_group_mbid: str | None = None,
+        content_variant: str = "original",
     ) -> None:
         requested_at = datetime.now(timezone.utc).isoformat()
         normalized_mbid = musicbrainz_id.lower()
@@ -203,8 +278,9 @@ class RequestHistoryStore:
                     musicbrainz_id_lower, musicbrainz_id, artist_name, album_title,
                     artist_mbid, year, cover_url, requested_at, completed_at, status,
                     monitor_artist, auto_download_artist, user_id, requested_by_name,
-                    release_mbid
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                    release_mbid, request_kind, track_title, duration_seconds,
+                    track_release_group_mbid, content_variant
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(musicbrainz_id_lower) DO UPDATE SET
                     musicbrainz_id = excluded.musicbrainz_id,
                     artist_name = excluded.artist_name,
@@ -219,7 +295,12 @@ class RequestHistoryStore:
                     auto_download_artist = excluded.auto_download_artist,
                     user_id = COALESCE(excluded.user_id, request_history.user_id),
                     requested_by_name = COALESCE(excluded.requested_by_name, request_history.requested_by_name),
-                    release_mbid = excluded.release_mbid
+                    release_mbid = excluded.release_mbid,
+                    request_kind = excluded.request_kind,
+                    track_title = excluded.track_title,
+                    duration_seconds = excluded.duration_seconds,
+                    track_release_group_mbid = excluded.track_release_group_mbid,
+                    content_variant = excluded.content_variant
                 """,
                 (
                     normalized_mbid,
@@ -236,8 +317,28 @@ class RequestHistoryStore:
                     user_id,
                     requested_by_name,
                     release_mbid,
+                    request_kind,
+                    track_title,
+                    duration_seconds,
+                    track_release_group_mbid,
+                    content_variant,
                 ),
             )
+            if user_id is not None:
+                conn.execute(
+                    """
+                    INSERT INTO request_history_requesters (
+                        user_id, musicbrainz_id_lower, requested_at, requested_by_name
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (user_id, musicbrainz_id_lower) DO UPDATE SET
+                        requested_at = excluded.requested_at,
+                        requested_by_name = COALESCE(
+                            excluded.requested_by_name,
+                            request_history_requesters.requested_by_name
+                        )
+                    """,
+                    (user_id, normalized_mbid, requested_at, requested_by_name),
+                )
 
         await self._write(operation)
 
@@ -302,7 +403,140 @@ class RequestHistoryStore:
                 """,
                 rows,
             )
+            if user_id is not None:
+                conn.executemany(
+                    """
+                    INSERT INTO request_history_requesters (
+                        user_id, musicbrainz_id_lower, requested_at, requested_by_name
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (user_id, musicbrainz_id_lower) DO UPDATE SET
+                        requested_at = excluded.requested_at,
+                        requested_by_name = COALESCE(
+                            excluded.requested_by_name,
+                            request_history_requesters.requested_by_name
+                        )
+                    """,
+                    [
+                        (
+                            user_id,
+                            item["musicbrainz_id"].lower(),
+                            requested_at,
+                            requested_by_name,
+                        )
+                        for item in items
+                    ],
+                )
             return len(rows)
+
+        return await self._write(operation)
+
+    async def async_add_requester(
+        self,
+        musicbrainz_id: str,
+        user_id: str | None,
+        requested_by_name: str | None = None,
+    ) -> None:
+        if user_id is None:
+            return
+        await self.async_add_requesters(
+            [musicbrainz_id], user_id, requested_by_name=requested_by_name
+        )
+
+    async def async_add_requesters(
+        self,
+        musicbrainz_ids: list[str],
+        user_id: str | None,
+        requested_by_name: str | None = None,
+    ) -> None:
+        if user_id is None:
+            return
+        requested_at = datetime.now(timezone.utc).isoformat()
+        normalized = list(
+            dict.fromkeys(value.casefold() for value in musicbrainz_ids if value)
+        )
+        if not normalized:
+            return
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                """
+                INSERT INTO request_history_requesters (
+                    user_id, musicbrainz_id_lower, requested_at, requested_by_name
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT (user_id, musicbrainz_id_lower) DO UPDATE SET
+                    requested_at = excluded.requested_at,
+                    requested_by_name = COALESCE(
+                        excluded.requested_by_name,
+                        request_history_requesters.requested_by_name
+                    )
+                """,
+                [
+                    (user_id, musicbrainz_id, requested_at, requested_by_name)
+                    for musicbrainz_id in normalized
+                ],
+            )
+
+        await self._write(operation)
+
+    async def async_is_requester(self, user_id: str, musicbrainz_id: str) -> bool:
+        normalized_mbid = musicbrainz_id.casefold()
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM request_history_requesters "
+                "WHERE user_id = ? AND musicbrainz_id_lower = ?",
+                (user_id, normalized_mbid),
+            ).fetchone()
+            return row is not None
+
+        return await self._read(operation)
+
+    async def async_requester_count(self, musicbrainz_id: str) -> int:
+        normalized_mbid = musicbrainz_id.casefold()
+
+        def operation(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM request_history_requesters "
+                "WHERE musicbrainz_id_lower = ?",
+                (normalized_mbid,),
+            ).fetchone()
+            return int(row["count"] if row is not None else 0)
+
+        return await self._read(operation)
+
+    async def async_remove_requester(self, user_id: str, musicbrainz_id: str) -> bool:
+        """Remove only one listener's interest and transfer primary attribution."""
+        normalized_mbid = musicbrainz_id.casefold()
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "DELETE FROM request_history_requesters "
+                "WHERE user_id = ? AND musicbrainz_id_lower = ?",
+                (user_id, normalized_mbid),
+            )
+            if cursor.rowcount <= 0:
+                return False
+            owner = conn.execute(
+                "SELECT user_id FROM request_history " "WHERE musicbrainz_id_lower = ?",
+                (normalized_mbid,),
+            ).fetchone()
+            if owner is not None and owner["user_id"] == user_id:
+                successor = conn.execute(
+                    "SELECT user_id, requested_by_name FROM request_history_requesters "
+                    "WHERE musicbrainz_id_lower = ? ORDER BY requested_at ASC LIMIT 1",
+                    (normalized_mbid,),
+                ).fetchone()
+                if successor is not None:
+                    conn.execute(
+                        "UPDATE request_history SET user_id = ?, requested_by_name = ? "
+                        "WHERE musicbrainz_id_lower = ?",
+                        (
+                            successor["user_id"],
+                            successor["requested_by_name"],
+                            normalized_mbid,
+                        ),
+                    )
+            return True
 
         return await self._write(operation)
 
@@ -423,6 +657,18 @@ class RequestHistoryStore:
                     (source_key,),
                 )
                 conn.execute(
+                    "INSERT OR IGNORE INTO request_history_requesters "
+                    "(user_id, musicbrainz_id_lower, requested_at, requested_by_name) "
+                    "SELECT user_id, ?, requested_at, requested_by_name "
+                    "FROM request_history_requesters WHERE musicbrainz_id_lower = ?",
+                    (target_key, source_key),
+                )
+                conn.execute(
+                    "DELETE FROM request_history_requesters "
+                    "WHERE musicbrainz_id_lower = ?",
+                    (source_key,),
+                )
+                conn.execute(
                     "DELETE FROM request_history WHERE musicbrainz_id_lower IN (?, ?)",
                     (source_key, target_key),
                 )
@@ -534,7 +780,10 @@ class RequestHistoryStore:
 
         def operation(conn: sqlite3.Connection) -> int:
             row = conn.execute(
-                f"SELECT COUNT(*) AS count FROM request_history WHERE user_id = ? AND status IN ({placeholders})",
+                "SELECT COUNT(*) AS count FROM request_history AS rh "
+                "JOIN request_history_requesters AS rr "
+                "ON rr.musicbrainz_id_lower = rh.musicbrainz_id_lower "
+                f"WHERE rr.user_id = ? AND rh.status IN ({placeholders})",
                 (user_id, *self._USER_ACTIVE_STATUSES),
             ).fetchone()
             return int(row["count"] if row is not None else 0)
@@ -549,7 +798,14 @@ class RequestHistoryStore:
 
         def operation(conn: sqlite3.Connection) -> list[RequestHistoryRecord]:
             rows = conn.execute(
-                f"SELECT * FROM request_history WHERE user_id = ? AND status IN ({placeholders}) ORDER BY requested_at DESC",
+                "SELECT rh.*, rr.user_id AS requester_user_id, "
+                "rr.requested_by_name AS requester_name, "
+                "rr.requested_at AS requester_requested_at "
+                "FROM request_history AS rh "
+                "JOIN request_history_requesters AS rr "
+                "ON rr.musicbrainz_id_lower = rh.musicbrainz_id_lower "
+                f"WHERE rr.user_id = ? AND rh.status IN ({placeholders}) "
+                "ORDER BY rr.requested_at DESC",
                 (user_id, *self._USER_ACTIVE_STATUSES),
             ).fetchall()
             return [
@@ -647,36 +903,44 @@ class RequestHistoryStore:
         offset = (safe_page - 1) * safe_page_size
 
         _SORT_MAP = {
-            "newest": "requested_at DESC",
-            "oldest": "requested_at ASC",
-            "status": "status ASC, requested_at DESC",
+            "newest": "rr.requested_at DESC",
+            "oldest": "rr.requested_at ASC",
+            "status": "rh.status ASC, rr.requested_at DESC",
         }
-        order_clause = _SORT_MAP.get(sort or "", "requested_at DESC")
+        order_clause = _SORT_MAP.get(sort or "", "rr.requested_at DESC")
 
         def operation(
             conn: sqlite3.Connection,
         ) -> tuple[list[RequestHistoryRecord], int]:
             dismiss_clause = (
-                "AND musicbrainz_id_lower NOT IN "
+                "AND rh.musicbrainz_id_lower NOT IN "
                 "(SELECT musicbrainz_id_lower FROM request_history_dismissals WHERE user_id = ?)"
             )
             if status_filter == "reimportable":
-                where = (
-                    f"WHERE user_id = ? AND {_REIMPORTABLE_CONDITION} {dismiss_clause}"
-                )
+                where = f"WHERE rr.user_id = ? AND {_REIMPORTABLE_JOIN_CONDITION} {dismiss_clause}"
                 params: tuple = (user_id, user_id)
             elif status_filter:
-                where = f"WHERE user_id = ? AND status = ? {dismiss_clause}"
+                where = f"WHERE rr.user_id = ? AND rh.status = ? {dismiss_clause}"
                 params = (user_id, status_filter, user_id)
             else:
-                where = f"WHERE user_id = ? {dismiss_clause}"
+                where = f"WHERE rr.user_id = ? {dismiss_clause}"
                 params = (user_id, user_id)
 
             total_row = conn.execute(
-                f"SELECT COUNT(*) AS count FROM request_history {where}", params
+                "SELECT COUNT(*) AS count FROM request_history AS rh "
+                "JOIN request_history_requesters AS rr "
+                "ON rr.musicbrainz_id_lower = rh.musicbrainz_id_lower "
+                f"{where}",
+                params,
             ).fetchone()
             rows = conn.execute(
-                f"SELECT * FROM request_history {where} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+                "SELECT rh.*, rr.user_id AS requester_user_id, "
+                "rr.requested_by_name AS requester_name, "
+                "rr.requested_at AS requester_requested_at "
+                "FROM request_history AS rh "
+                "JOIN request_history_requesters AS rr "
+                "ON rr.musicbrainz_id_lower = rh.musicbrainz_id_lower "
+                f"{where} ORDER BY {order_clause} LIMIT ? OFFSET ?",
                 params + (safe_page_size, offset),
             ).fetchall()
             records = [
@@ -802,6 +1066,25 @@ class RequestHistoryStore:
 
         await self._write(operation)
 
+    async def async_get_record_by_download_task_id(
+        self, download_task_id: str
+    ) -> RequestHistoryRecord | None:
+        """Resolve the request that owns a native task.
+
+        Album requests historically used the release-group MBID as their key.
+        Exact-track requests use the recording MBID, so task ownership is the
+        only identifier that is correct for both request kinds.
+        """
+
+        def operation(conn: sqlite3.Connection) -> RequestHistoryRecord | None:
+            row = conn.execute(
+                "SELECT * FROM request_history WHERE download_task_id = ? LIMIT 1",
+                (download_task_id,),
+            ).fetchone()
+            return self._row_to_record(row)
+
+        return await self._read(operation)
+
     async def async_delete_record(self, musicbrainz_id: str) -> bool:
         normalized_mbid = musicbrainz_id.lower()
 
@@ -812,6 +1095,10 @@ class RequestHistoryStore:
             )
             conn.execute(
                 "DELETE FROM request_history_dismissals WHERE musicbrainz_id_lower = ?",
+                (normalized_mbid,),
+            )
+            conn.execute(
+                "DELETE FROM request_history_requesters WHERE musicbrainz_id_lower = ?",
                 (normalized_mbid,),
             )
             return cursor.rowcount > 0
@@ -877,6 +1164,10 @@ class RequestHistoryStore:
                 # no wanted_watches table yet (fresh DB before the store's first
                 # construction) - nothing can be watched, prune unguarded
                 cursor = conn.execute(base, (*terminal_statuses, cutoff_iso))
+            conn.execute(
+                "DELETE FROM request_history_requesters WHERE musicbrainz_id_lower "
+                "NOT IN (SELECT musicbrainz_id_lower FROM request_history)"
+            )
             return cursor.rowcount
 
         return await self._write(operation)
