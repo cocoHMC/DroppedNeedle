@@ -13,6 +13,7 @@ import {
 	derivedDownloadStatus,
 	formatCountdown,
 	formatRetryEta,
+	hasActiveTask,
 	isWanted,
 	nowPressing,
 	retryDisplay,
@@ -88,6 +89,19 @@ describe('derivedDownloadStatus', () => {
 		expect(
 			derivedDownloadStatus(task({ status: 'queued', search_job_id: 'j', candidate_index: 0 }))
 		).toBe('queued');
+	});
+
+	it('REST review status remains an existing task and offers the review section', () => {
+		const reviewing = task({
+			status: 'awaiting_review',
+			search_job_id: 'j',
+			candidate_index: null
+		});
+		expect(hasActiveTask([reviewing])).toBe(true);
+		expect(sectionForTask(reviewing, 0)).toBe('needs_you');
+		expect(tabForTask(reviewing)).toBe('review');
+		expect(canRetry(reviewing)).toBe(false);
+		expect(canCancel(reviewing)).toBe(false);
 	});
 
 	it('passes non-queued statuses through unchanged', () => {

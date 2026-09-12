@@ -174,6 +174,27 @@ def test_get_download_returns_task():
     assert response.json()["album_title"] == "OK Computer"
 
 
+def test_polling_and_queue_list_expose_parked_source_review():
+    service = AsyncMock()
+    parked = _task("review", status="queued", search_job_id="job", candidate_index=None)
+    searching = _task("search", status="queued", search_job_id=None)
+    picked = _task("picked", status="queued", search_job_id="job", candidate_index=0)
+    cancelled = _task("cancelled", status="cancelled", search_job_id="job", candidate_index=None)
+    service.get_task.return_value = parked
+    service.list_tasks.return_value = [parked, searching, picked, cancelled]
+    client = build_test_client(_app(service))
+
+    response = client.get("/downloads/review")
+    assert response.status_code == 200
+    assert response.json()["status"] == "awaiting_review"
+    listed = client.get("/downloads")
+    assert listed.status_code == 200
+    assert [item["status"] for item in listed.json()["items"]] == [
+        "awaiting_review", "queued", "queued", "cancelled"
+    ]
+    assert parked.status == "queued"  # presentation must not mutate persistence
+
+
 def test_get_download_unauthenticated_401():
     service = AsyncMock()
     app = FastAPI()
